@@ -14,12 +14,9 @@
 #include "rocksdb/status.h"
 
 #ifdef USE_HDFS
-#include "hdfs/hdfs.h"
+#include <hdfs.h>
 
 namespace rocksdb {
-
-static const std::string kProto = "hdfs://";
-static const std::string pathsep = "/";
 
 // Thrown during execution when there is an issue with the supplied
 // arguments.
@@ -47,7 +44,7 @@ private:
 class HdfsEnv : public Env {
 
  public:
-  HdfsEnv(const std::string& fsname) : fsname_(fsname) {
+  explicit HdfsEnv(const std::string& fsname) : fsname_(fsname) {
     posixEnv = Env::Default();
     fileSys_ = connectToPath(fsname_);
   }
@@ -58,17 +55,23 @@ class HdfsEnv : public Env {
   }
 
   virtual Status NewSequentialFile(const std::string& fname,
-                                   SequentialFile** result);
+                                   std::unique_ptr<SequentialFile>* result,
+                                   const EnvOptions& options);
 
   virtual Status NewRandomAccessFile(const std::string& fname,
-                                     RandomAccessFile** result);
+                                     std::unique_ptr<RandomAccessFile>* result,
+                                     const EnvOptions& options);
 
   virtual Status NewWritableFile(const std::string& fname,
-                                 WritableFile** result);
+                                 std::unique_ptr<WritableFile>* result,
+                                 const EnvOptions& options);
 
   virtual Status NewRandomRWFile(const std::string& fname,
-                                 unique_ptr<RandomRWFile>* result,
+                                 std::unique_ptr<RandomRWFile>* result,
                                  const EnvOptions& options);
+
+  virtual Status NewDirectory(const std::string& name,
+                              std::unique_ptr<Directory>* result);
 
   virtual bool FileExists(const std::string& fname);
 
@@ -94,7 +97,8 @@ class HdfsEnv : public Env {
 
   virtual Status UnlockFile(FileLock* lock);
 
-  virtual Status NewLogger(const std::string& fname, Logger** result);
+  virtual Status NewLogger(const std::string& fname,
+                           std::shared_ptr<Logger>* result);
 
   virtual void Schedule(void (*function)(void* arg), void* arg,
                         Priority pri = LOW) {
@@ -103,6 +107,13 @@ class HdfsEnv : public Env {
 
   virtual void StartThread(void (*function)(void* arg), void* arg) {
     posixEnv->StartThread(function, arg);
+  }
+
+  virtual void WaitForJoin() { posixEnv->WaitForJoin(); }
+
+  virtual unsigned int GetThreadPoolQueueLen(Priority pri = LOW) const
+      override {
+    return posixEnv->GetThreadPoolQueueLen(pri);
   }
 
   virtual Status GetTestDirectory(std::string* path) {
@@ -151,6 +162,9 @@ class HdfsEnv : public Env {
                         // object here so that we can use posix timers,
                         // posix threads, etc.
 
+  static const std::string kProto;
+  static const std::string pathsep;
+
   /**
    * If the URI is specified of the form hdfs://server:port/path,
    * then connect to the specified cluster
@@ -158,7 +172,7 @@ class HdfsEnv : public Env {
    */
   hdfsFS connectToPath(const std::string& uri) {
     if (uri.empty()) {
-      return NULL;
+      return nullptr;
     }
     if (uri.find(kProto) != 0) {
       // uri doesn't start with hdfs:// -> use default:0, which is special
@@ -215,10 +229,10 @@ static const Status notsup;
 class HdfsEnv : public Env {
 
  public:
-  HdfsEnv(const std::string& fsname) {
+  explicit HdfsEnv(const std::string& fsname) {
     fprintf(stderr, "You have not build rocksdb with HDFS support\n");
     fprintf(stderr, "Please see hdfs/README for details\n");
-    throw new std::exception();
+    throw std::exception();
   }
 
   virtual ~HdfsEnv() {
@@ -243,6 +257,11 @@ class HdfsEnv : public Env {
   virtual Status NewRandomRWFile(const std::string& fname,
                                  unique_ptr<RandomRWFile>* result,
                                  const EnvOptions& options) {
+    return notsup;
+  }
+
+  virtual Status NewDirectory(const std::string& name,
+                              unique_ptr<Directory>* result) {
     return notsup;
   }
 
@@ -279,6 +298,12 @@ class HdfsEnv : public Env {
                         Priority pri = LOW) {}
 
   virtual void StartThread(void (*function)(void* arg), void* arg) {}
+
+  virtual void WaitForJoin() {}
+
+  virtual unsigned int GetThreadPoolQueueLen(Priority pri = LOW) const {
+    return 0;
+  }
 
   virtual Status GetTestDirectory(std::string* path) {return notsup;}
 

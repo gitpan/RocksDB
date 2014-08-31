@@ -3,7 +3,7 @@ use 5.008001;
 use strict;
 use warnings;
 
-our $VERSION = "0.02";
+our $VERSION = "0.03";
 
 require XSLoader;
 XSLoader::load(__PACKAGE__, $VERSION);
@@ -59,6 +59,16 @@ B<RocksDB> is a Perl extension for RocksDB.
 RocksDB is an embeddable persistent key-value store for fast storage.
 
 See L<http://rocksdb.org/> for more details.
+
+=head1 INSTALLATION
+
+This distribution bundles the rocksdb source tree, so you don't need to have rocksdb.
+
+If rocksdb already installed, the installer figures out it.
+
+rocksdb depends on some environment. See vendor/rocksdb/INSTALL.md before installation.
+
+Currently rocksdb supports Linux and OS X only.
 
 =head1 CONSTRUCTOR
 
@@ -328,6 +338,26 @@ For details, see the documentation for RocksDB itself.
 
 =over 4
 
+=item IncreaseParallelism :Undef
+
+Call DBOptions.IncreaseParallelism(). Value will be ignored.
+
+=item PrepareForBulkLoad :Undef
+
+Call Options.PrepareForBulkLoad(). Value will be ignored.
+
+=item OptimizeForPointLookup :Undef
+
+Call ColumnFamilyOptions.OptimizeForPointLookup(). Value will be ignored.
+
+=item OptimizeLevelStyleCompaction :Maybe[Int]
+
+Call ColumnFamilyOptions.OptimizeLevelStyleCompaction() with given value.
+
+=item OptimizeUniversalStyleCompaction :Maybe[Int]
+
+Call ColumnFamilyOptions.OptimizeUniversalStyleCompaction() with given value.
+
 =item read_only :Bool
 
 Defaults to false. If true, call rocksdb::DB::OpenForReadOnly().
@@ -372,6 +402,10 @@ Defaults to 1.
 
 Defaults to 1000.
 
+=item max_total_wal_size :Int
+
+Defaults to 0.
+
 =item block_cache :RocksDB::Cache
 
 Defaults to undef. See L<RocksDB::Cache>, L<RocksDB::LRUCache>.
@@ -395,11 +429,13 @@ Defaults to 'snappy'. It can be specified using the following arguments.
   snappy
   zlib
   bzip2
+  lz4
+  lz4hc
   none
 
 =item compression_per_level :ArrayRef[Str]
 
-  ['snappy', 'zlib', 'zlib', 'bzip2', ...]
+  ['snappy', 'zlib', 'zlib', 'bzip2', 'lz4', 'lz4hc' ...]
 
 =item filter_policy :RocksDB::FilterPolicy
 
@@ -491,7 +527,7 @@ Defaults to "".
 
 =item disable_seek_compaction :Bool
 
-Defaults to false.
+Defaults to true.
 
 =item delete_obsolete_files_period_micros :Int
 
@@ -503,7 +539,7 @@ Defaults to 1.
 
 =item max_background_flushes :Int
 
-Defaults to 0.
+Defaults to 1.
 
 =item max_log_file_size :Int
 
@@ -618,16 +654,29 @@ Defaults to false.
 
 Defaults to 0.
 
+=item allow_thread_local :Bool
+
+Defaults to true.
+
 =item compaction_style :Str
 
 Defaults to 'level'. It can be specified using the following arguments.
 
   level
   universal
+  fifo
+
+=item verify_checksums_in_compaction :Bool
+
+Defaults to true.
 
 =item compaction_options_universal :HashRef
 
 See 'Universal compaction options' section below.
+
+=item compaction_options_fifo :HashRef
+
+See 'FIFO compaction options' section below.
 
 =item filter_deletes :Bool
 
@@ -644,6 +693,30 @@ Defaults to false.
 =item inplace_update_num_locks :Int
 
 Defaults to 10000, if inplace_update_support = true, else 0.
+
+=item memtable_prefix_bloom_bits :Int
+
+If prefix_extractor is set and bloom_bits is not 0, create prefix bloom for memtable.
+
+=item memtable_prefix_bloom_probes :Int
+
+Number of hash probes per key.
+
+=item memtable_prefix_bloom_huge_page_tlb_size :Int
+
+Page size for huge page TLB for bloom in memtable. If <=0, not allocate from huge page TLB but from malloc.
+
+=item bloom_locality :Int
+
+Defaults to 0.
+
+=item max_successive_merges :Int
+
+Defaults to 0 (disabled).
+
+=item min_partial_merge_operands :Int
+
+Defaults to 2.
 
 =back
 
@@ -680,29 +753,31 @@ Defaults to 'total_size'. It can be specified using the following arguments.
 
 =back
 
+=head2 FIFO compaction options
+
+=over 4
+
+=item max_table_files_size :Int
+
+Defaults to 1GB.
+
+=back
+
 =head2 Read options
 
 =over 4
 
 =item verify_checksums :Bool
 
-Defaults to false.
+Defaults to true.
 
 =item fill_cache :Bool
 
 Defaults to true.
 
-=item prefix_seek :Bool
-
-Defaults to false.
-
 =item snapshot :RocksDB::Snapshot
 
 Defaults to undef.  See L<RocksDB::Snapshot>.
-
-=item prefix :Str
-
-Defaults to undef.
 
 =item read_tier :Str
 
@@ -710,6 +785,10 @@ Defaults to 'read_all'. It can be specified using the following arguments.
 
   read_all
   block_cache
+
+=item tailing :Bool
+
+Defaults to false.
 
 =back
 
@@ -724,6 +803,10 @@ Defaults to false.
 =item disableWAL :Bool
 
 Defaults to false.
+
+=item timeout_hint_us :Int
+
+Defaults to 0.
 
 =back
 

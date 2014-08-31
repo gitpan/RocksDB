@@ -9,16 +9,16 @@
 
 #include "db/builder.h"
 
-#include "db/filename.h"
 #include "db/dbformat.h"
+#include "db/filename.h"
 #include "db/merge_helper.h"
 #include "db/table_cache.h"
 #include "db/version_edit.h"
 #include "rocksdb/db.h"
-#include "rocksdb/table.h"
 #include "rocksdb/env.h"
 #include "rocksdb/iterator.h"
 #include "rocksdb/options.h"
+#include "rocksdb/table.h"
 #include "table/block_based_table_builder.h"
 #include "util/stop_watch.h"
 
@@ -26,25 +26,24 @@ namespace rocksdb {
 
 class TableFactory;
 
-TableBuilder* GetTableBuilder(const Options& options, WritableFile* file,
+TableBuilder* NewTableBuilder(const Options& options,
+                              const InternalKeyComparator& internal_comparator,
+                              WritableFile* file,
                               CompressionType compression_type) {
-  return options.table_factory->GetTableBuilder(options, file,
-                                                compression_type);
+  return options.table_factory->NewTableBuilder(options, internal_comparator,
+                                                file, compression_type);
 }
 
-Status BuildTable(const std::string& dbname,
-                  Env* env,
-                  const Options& options,
-                  const EnvOptions& soptions,
-                  TableCache* table_cache,
-                  Iterator* iter,
-                  FileMetaData* meta,
-                  const Comparator* user_comparator,
+Status BuildTable(const std::string& dbname, Env* env, const Options& options,
+                  const EnvOptions& soptions, TableCache* table_cache,
+                  Iterator* iter, FileMetaData* meta,
+                  const InternalKeyComparator& internal_comparator,
                   const SequenceNumber newest_snapshot,
                   const SequenceNumber earliest_seqno_in_memtable,
-                  const bool enable_compression) {
+                  const CompressionType compression,
+                  const Env::IOPriority io_priority) {
   Status s;
-  meta->file_size = 0;
+  meta->fd.file_size = 0;
   meta->smallest_seqno = meta->largest_seqno = 0;
   iter->SeekToFirst();
 
@@ -56,16 +55,18 @@ Status BuildTable(const std::string& dbname,
     purge = false;
   }
 
-  std::string fname = TableFileName(dbname, meta->number);
+  std::string fname = TableFileName(options.db_paths, meta->fd.GetNumber(),
+                                    meta->fd.GetPathId());
   if (iter->Valid()) {
     unique_ptr<WritableFile> file;
     s = env->NewWritableFile(fname, &file, soptions);
     if (!s.ok()) {
       return s;
     }
+    file->SetIOPriority(io_priority);
 
-    TableBuilder* builder = GetTableBuilder(options, file.get(),
-                                            options.compression);
+    TableBuilder* builder =
+        NewTableBuilder(options, internal_comparator, file.get(), compression);
 
     // the first key is the smallest key
     Slice key = iter->key();
@@ -73,8 +74,9 @@ Status BuildTable(const std::string& dbname,
     meta->smallest_seqno = GetInternalKeySeqno(key);
     meta->largest_seqno = meta->smallest_seqno;
 
-    MergeHelper merge(user_comparator, options.merge_operator.get(),
-                      options.info_log.get(),
+    MergeHelper merge(internal_comparator.user_comparator(),
+                      options.merge_operator.get(), options.info_log.get(),
+                      options.min_partial_merge_operands,
                       true /* internal key corruption is not ok */);
 
     if (purge) {
@@ -103,14 +105,21 @@ Status BuildTable(const std::string& dbname,
         // If the key is the same as the previous key (and it is not the
         // first key), then we skip it, since it is an older version.
         // Otherwise we output the key and mark it as the "new" previous key.
-        if (!is_first_key && !user_comparator->Compare(prev_ikey.user_key,
-                                                       this_ikey.user_key)) {
+        if (!is_first_key && !internal_comparator.user_comparator()->Compare(
+                                  prev_ikey.user_key, this_ikey.user_key)) {
           // seqno within the same key are in decreasing order
           assert(this_ikey.sequence < prev_ikey.sequence);
         } else {
           is_first_key = false;
 
           if (this_ikey.type == kTypeMerge) {
+            // TODO(tbd): Add a check here to prevent RocksDB from crash when
+            // reopening a DB w/o properly specifying the merge operator.  But
+            // currently we observed a memory leak on failing in RocksDB
+            // recovery, so we decide to let it crash instead of causing
+            // memory leak for now before we have identified the real cause
+            // of the memory leak.
+
             // Handle merge-type keys using the MergeHelper
             // TODO: pass statistics to MergeUntil
             merge.MergeUntil(iter, 0 /* don't worry about snapshot */);
@@ -178,8 +187,8 @@ Status BuildTable(const std::string& dbname,
     if (s.ok()) {
       s = builder->Finish();
       if (s.ok()) {
-        meta->file_size = builder->FileSize();
-        assert(meta->file_size > 0);
+        meta->fd.file_size = builder->FileSize();
+        assert(meta->fd.GetFileSize() > 0);
       }
     } else {
       builder->Abandon();
@@ -202,10 +211,8 @@ Status BuildTable(const std::string& dbname,
 
     if (s.ok()) {
       // Verify that the table is usable
-      Iterator* it = table_cache->NewIterator(ReadOptions(),
-                                              soptions,
-                                              meta->number,
-                                              meta->file_size);
+      Iterator* it = table_cache->NewIterator(ReadOptions(), soptions,
+                                              internal_comparator, meta->fd);
       s = it->status();
       delete it;
     }
@@ -216,7 +223,7 @@ Status BuildTable(const std::string& dbname,
     s = iter->status();
   }
 
-  if (s.ok() && meta->file_size > 0) {
+  if (s.ok() && meta->fd.GetFileSize() > 0) {
     // Keep it
   } else {
     env->DeleteFile(fname);

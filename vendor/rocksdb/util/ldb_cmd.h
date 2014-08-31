@@ -13,14 +13,15 @@
 
 #include "db/version_set.h"
 #include "rocksdb/env.h"
-#include "rocksdb/options.h"
 #include "rocksdb/iterator.h"
+#include "rocksdb/ldb_tool.h"
+#include "rocksdb/options.h"
 #include "rocksdb/slice.h"
+#include "rocksdb/utilities/db_ttl.h"
 #include "util/logging.h"
 #include "util/ldb_cmd_execute_result.h"
 #include "util/string_util.h"
-#include "utilities/utility_db.h"
-#include "utilities/ttl/db_ttl.h"
+#include "utilities/ttl/db_ttl_impl.h"
 
 using std::string;
 using std::map;
@@ -54,21 +55,27 @@ public:
 
   static LDBCommand* InitFromCmdLineArgs(
     const vector<string>& args,
-    const Options& options = Options()
+    const Options& options,
+    const LDBOptions& ldb_options
   );
 
   static LDBCommand* InitFromCmdLineArgs(
     int argc,
     char** argv,
-    const Options& options = Options()
+    const Options& options,
+    const LDBOptions& ldb_options
   );
 
   bool ValidateCmdLineOptions();
 
   virtual Options PrepareOptionsForOpenDB();
 
-  virtual void SetOptions(Options options) {
+  virtual void SetDBOptions(Options options) {
     options_ = options;
+  }
+
+  void SetLDBOptions(const LDBOptions& ldb_options) {
+    ldb_options_ = ldb_options;
   }
 
   virtual bool NoDBOpen() {
@@ -149,7 +156,7 @@ protected:
   LDBCommandExecuteResult exec_state_;
   string db_path_;
   DB* db_;
-  StackableDB* sdb_;
+  DBWithTTL* db_ttl_;
 
   /**
    * true implies that this command can work if the db is opened in read-only
@@ -217,11 +224,11 @@ protected:
     Status st;
     if (is_db_ttl_) {
       if (is_read_only_) {
-        st = UtilityDB::OpenTtlDB(opt, db_path_, &sdb_, 0, true);
+        st = DBWithTTL::Open(opt, db_path_, &db_ttl_, 0, true);
       } else {
-        st = UtilityDB::OpenTtlDB(opt, db_path_, &sdb_);
+        st = DBWithTTL::Open(opt, db_path_, &db_ttl_);
       }
-      db_ = sdb_;
+      db_ = db_ttl_;
     } else if (is_read_only_) {
       st = DB::OpenForReadOnly(opt, db_path_, &db_);
     } else {
@@ -291,6 +298,7 @@ protected:
                          const string& option, string* value);
 
   Options options_;
+  LDBOptions ldb_options_;
 
 private:
 
@@ -482,6 +490,23 @@ private:
 
   static const string ARG_VERBOSE;
   static const string ARG_PATH;
+};
+
+class ListColumnFamiliesCommand : public LDBCommand {
+ public:
+  static string Name() { return "list_column_families"; }
+
+  ListColumnFamiliesCommand(const vector<string>& params,
+                            const map<string, string>& options,
+                            const vector<string>& flags);
+
+  static void Help(string& ret);
+  virtual void DoCommand();
+
+  virtual bool NoDBOpen() { return true; }
+
+ private:
+  string dbname_;
 };
 
 class ReduceDBLevelsCommand : public LDBCommand {
@@ -684,6 +709,22 @@ private:
   static const char* GET_CMD;
   static const char* PUT_CMD;
   static const char* DELETE_CMD;
+};
+
+class CheckConsistencyCommand : public LDBCommand {
+public:
+  static string Name() { return "checkconsistency"; }
+
+  CheckConsistencyCommand(const vector<string>& params,
+      const map<string, string>& options, const vector<string>& flags);
+
+  virtual void DoCommand();
+
+  virtual bool NoDBOpen() {
+    return true;
+  }
+
+  static void Help(string& ret);
 };
 
 } // namespace rocksdb

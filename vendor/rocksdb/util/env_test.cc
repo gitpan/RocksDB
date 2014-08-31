@@ -7,13 +7,20 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
+#include <sys/types.h>
 
 #include <iostream>
 #include <unordered_set>
 
+#ifdef OS_LINUX
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
+
 #include "rocksdb/env.h"
 #include "port/port.h"
 #include "util/coding.h"
+#include "util/log_buffer.h"
 #include "util/mutexlock.h"
 #include "util/testharness.h"
 
@@ -166,19 +173,235 @@ TEST(EnvPosixTest, TwoPools) {
   env_->SetBackgroundThreads(kLowPoolSize);
   env_->SetBackgroundThreads(kHighPoolSize, Env::Priority::HIGH);
 
+  ASSERT_EQ(0U, env_->GetThreadPoolQueueLen(Env::Priority::LOW));
+  ASSERT_EQ(0U, env_->GetThreadPoolQueueLen(Env::Priority::HIGH));
+
   // schedule same number of jobs in each pool
   for (int i = 0; i < kJobs; i++) {
     env_->Schedule(&CB::Run, &low_pool_job);
     env_->Schedule(&CB::Run, &high_pool_job, Env::Priority::HIGH);
   }
+  // Wait a short while for the jobs to be dispatched.
+  Env::Default()->SleepForMicroseconds(kDelayMicros);
+  ASSERT_EQ((unsigned int)(kJobs - kLowPoolSize),
+            env_->GetThreadPoolQueueLen());
+  ASSERT_EQ((unsigned int)(kJobs - kLowPoolSize),
+            env_->GetThreadPoolQueueLen(Env::Priority::LOW));
+  ASSERT_EQ((unsigned int)(kJobs - kHighPoolSize),
+            env_->GetThreadPoolQueueLen(Env::Priority::HIGH));
 
   // wait for all jobs to finish
   while (low_pool_job.NumFinished() < kJobs ||
          high_pool_job.NumFinished() < kJobs) {
     env_->SleepForMicroseconds(kDelayMicros);
   }
+
+  ASSERT_EQ(0U, env_->GetThreadPoolQueueLen(Env::Priority::LOW));
+  ASSERT_EQ(0U, env_->GetThreadPoolQueueLen(Env::Priority::HIGH));
 }
 
+TEST(EnvPosixTest, DecreaseNumBgThreads) {
+  class SleepingBackgroundTask {
+   public:
+    explicit SleepingBackgroundTask()
+        : bg_cv_(&mutex_), should_sleep_(true), sleeping_(false) {}
+    void DoSleep() {
+      MutexLock l(&mutex_);
+      sleeping_ = true;
+      while (should_sleep_) {
+        bg_cv_.Wait();
+      }
+      sleeping_ = false;
+      bg_cv_.SignalAll();
+    }
+
+    void WakeUp() {
+      MutexLock l(&mutex_);
+      should_sleep_ = false;
+      bg_cv_.SignalAll();
+
+      while (sleeping_) {
+        bg_cv_.Wait();
+      }
+    }
+
+    bool IsSleeping() {
+      MutexLock l(&mutex_);
+      return sleeping_;
+    }
+
+    static void DoSleepTask(void* arg) {
+      reinterpret_cast<SleepingBackgroundTask*>(arg)->DoSleep();
+    }
+
+   private:
+    port::Mutex mutex_;
+    port::CondVar bg_cv_;  // Signalled when background work finishes
+    bool should_sleep_;
+    bool sleeping_;
+  };
+
+  std::vector<SleepingBackgroundTask> tasks(10);
+
+  // Set number of thread to 1 first.
+  env_->SetBackgroundThreads(1, Env::Priority::HIGH);
+  Env::Default()->SleepForMicroseconds(kDelayMicros);
+
+  // Schedule 3 tasks. 0 running; Task 1, 2 waiting.
+  for (size_t i = 0; i < 3; i++) {
+    env_->Schedule(&SleepingBackgroundTask::DoSleepTask, &tasks[i],
+                   Env::Priority::HIGH);
+    Env::Default()->SleepForMicroseconds(kDelayMicros);
+  }
+  ASSERT_EQ(2U, env_->GetThreadPoolQueueLen(Env::Priority::HIGH));
+  ASSERT_TRUE(tasks[0].IsSleeping());
+  ASSERT_TRUE(!tasks[1].IsSleeping());
+  ASSERT_TRUE(!tasks[2].IsSleeping());
+
+  // Increase to 2 threads. Task 0, 1 running; 2 waiting
+  env_->SetBackgroundThreads(2, Env::Priority::HIGH);
+  Env::Default()->SleepForMicroseconds(kDelayMicros);
+  ASSERT_EQ(1U, env_->GetThreadPoolQueueLen(Env::Priority::HIGH));
+  ASSERT_TRUE(tasks[0].IsSleeping());
+  ASSERT_TRUE(tasks[1].IsSleeping());
+  ASSERT_TRUE(!tasks[2].IsSleeping());
+
+  // Shrink back to 1 thread. Still task 0, 1 running, 2 waiting
+  env_->SetBackgroundThreads(1, Env::Priority::HIGH);
+  Env::Default()->SleepForMicroseconds(kDelayMicros);
+  ASSERT_EQ(1U, env_->GetThreadPoolQueueLen(Env::Priority::HIGH));
+  ASSERT_TRUE(tasks[0].IsSleeping());
+  ASSERT_TRUE(tasks[1].IsSleeping());
+  ASSERT_TRUE(!tasks[2].IsSleeping());
+
+  // The last task finishes. Task 0 running, 2 waiting.
+  tasks[1].WakeUp();
+  Env::Default()->SleepForMicroseconds(kDelayMicros);
+  ASSERT_EQ(1U, env_->GetThreadPoolQueueLen(Env::Priority::HIGH));
+  ASSERT_TRUE(tasks[0].IsSleeping());
+  ASSERT_TRUE(!tasks[1].IsSleeping());
+  ASSERT_TRUE(!tasks[2].IsSleeping());
+
+  // Increase to 5 threads. Task 0 and 2 running.
+  env_->SetBackgroundThreads(5, Env::Priority::HIGH);
+  Env::Default()->SleepForMicroseconds(kDelayMicros);
+  ASSERT_EQ((unsigned int)0, env_->GetThreadPoolQueueLen(Env::Priority::HIGH));
+  ASSERT_TRUE(tasks[0].IsSleeping());
+  ASSERT_TRUE(tasks[2].IsSleeping());
+
+  // Change number of threads a couple of times while there is no sufficient
+  // tasks.
+  env_->SetBackgroundThreads(7, Env::Priority::HIGH);
+  Env::Default()->SleepForMicroseconds(kDelayMicros);
+  tasks[2].WakeUp();
+  ASSERT_EQ(0U, env_->GetThreadPoolQueueLen(Env::Priority::HIGH));
+  env_->SetBackgroundThreads(3, Env::Priority::HIGH);
+  Env::Default()->SleepForMicroseconds(kDelayMicros);
+  ASSERT_EQ(0U, env_->GetThreadPoolQueueLen(Env::Priority::HIGH));
+  env_->SetBackgroundThreads(4, Env::Priority::HIGH);
+  Env::Default()->SleepForMicroseconds(kDelayMicros);
+  ASSERT_EQ(0U, env_->GetThreadPoolQueueLen(Env::Priority::HIGH));
+  env_->SetBackgroundThreads(5, Env::Priority::HIGH);
+  Env::Default()->SleepForMicroseconds(kDelayMicros);
+  ASSERT_EQ(0U, env_->GetThreadPoolQueueLen(Env::Priority::HIGH));
+  env_->SetBackgroundThreads(4, Env::Priority::HIGH);
+  Env::Default()->SleepForMicroseconds(kDelayMicros);
+  ASSERT_EQ(0U, env_->GetThreadPoolQueueLen(Env::Priority::HIGH));
+
+  Env::Default()->SleepForMicroseconds(kDelayMicros * 50);
+
+  // Enqueue 5 more tasks. Thread pool size now is 4.
+  // Task 0, 3, 4, 5 running;6, 7 waiting.
+  for (size_t i = 3; i < 8; i++) {
+    env_->Schedule(&SleepingBackgroundTask::DoSleepTask, &tasks[i],
+                   Env::Priority::HIGH);
+  }
+  Env::Default()->SleepForMicroseconds(kDelayMicros);
+  ASSERT_EQ(2U, env_->GetThreadPoolQueueLen(Env::Priority::HIGH));
+  ASSERT_TRUE(tasks[3].IsSleeping());
+  ASSERT_TRUE(tasks[4].IsSleeping());
+  ASSERT_TRUE(tasks[5].IsSleeping());
+  ASSERT_TRUE(!tasks[6].IsSleeping());
+  ASSERT_TRUE(!tasks[7].IsSleeping());
+
+  // Wake up task 0, 3 and 4. Task 5, 6, 7 running.
+  tasks[0].WakeUp();
+  tasks[3].WakeUp();
+  tasks[4].WakeUp();
+
+  Env::Default()->SleepForMicroseconds(kDelayMicros);
+  ASSERT_EQ((unsigned int)0, env_->GetThreadPoolQueueLen(Env::Priority::HIGH));
+  for (size_t i = 5; i < 8; i++) {
+    ASSERT_TRUE(tasks[i].IsSleeping());
+  }
+
+  // Shrink back to 1 thread. Still task 5, 6, 7 running
+  env_->SetBackgroundThreads(1, Env::Priority::HIGH);
+  Env::Default()->SleepForMicroseconds(kDelayMicros);
+  ASSERT_TRUE(tasks[5].IsSleeping());
+  ASSERT_TRUE(tasks[6].IsSleeping());
+  ASSERT_TRUE(tasks[7].IsSleeping());
+
+  // Wake up task  6. Task 5, 7 running
+  tasks[6].WakeUp();
+  Env::Default()->SleepForMicroseconds(kDelayMicros);
+  ASSERT_TRUE(tasks[5].IsSleeping());
+  ASSERT_TRUE(!tasks[6].IsSleeping());
+  ASSERT_TRUE(tasks[7].IsSleeping());
+
+  // Wake up threads 7. Task 5 running
+  tasks[7].WakeUp();
+  Env::Default()->SleepForMicroseconds(kDelayMicros);
+  ASSERT_TRUE(!tasks[7].IsSleeping());
+
+  // Enqueue thread 8 and 9. Task 5 running; one of 8, 9 might be running.
+  env_->Schedule(&SleepingBackgroundTask::DoSleepTask, &tasks[8],
+                 Env::Priority::HIGH);
+  env_->Schedule(&SleepingBackgroundTask::DoSleepTask, &tasks[9],
+                 Env::Priority::HIGH);
+  Env::Default()->SleepForMicroseconds(kDelayMicros);
+  ASSERT_GT(env_->GetThreadPoolQueueLen(Env::Priority::HIGH), (unsigned int)0);
+  ASSERT_TRUE(!tasks[8].IsSleeping() || !tasks[9].IsSleeping());
+
+  // Increase to 4 threads. Task 5, 8, 9 running.
+  env_->SetBackgroundThreads(4, Env::Priority::HIGH);
+  Env::Default()->SleepForMicroseconds(kDelayMicros);
+  ASSERT_EQ((unsigned int)0, env_->GetThreadPoolQueueLen(Env::Priority::HIGH));
+  ASSERT_TRUE(tasks[8].IsSleeping());
+  ASSERT_TRUE(tasks[9].IsSleeping());
+
+  // Shrink to 1 thread
+  env_->SetBackgroundThreads(1, Env::Priority::HIGH);
+
+  // Wake up thread 9.
+  tasks[9].WakeUp();
+  Env::Default()->SleepForMicroseconds(kDelayMicros);
+  ASSERT_TRUE(!tasks[9].IsSleeping());
+  ASSERT_TRUE(tasks[8].IsSleeping());
+
+  // Wake up thread 8
+  tasks[8].WakeUp();
+  Env::Default()->SleepForMicroseconds(kDelayMicros);
+  ASSERT_TRUE(!tasks[8].IsSleeping());
+
+  // Wake up the last thread
+  tasks[5].WakeUp();
+
+  Env::Default()->SleepForMicroseconds(kDelayMicros);
+  ASSERT_TRUE(!tasks[5].IsSleeping());
+}
+
+#ifdef OS_LINUX
+// To make sure the Env::GetUniqueId() related tests work correctly, The files
+// should be stored in regular storage like "hard disk" or "flash device".
+// Otherwise we cannot get the correct id.
+//
+// The following function act as the replacement of test::TmpDir() that may be
+// customized by user to be on a storage that doesn't work with GetUniqueId().
+//
+// TODO(kailiu) This function still assumes /tmp/<test-dir> reside in regular
+// storage system.
+namespace {
 bool IsSingleVarint(const std::string& s) {
   Slice slice(s);
 
@@ -190,7 +413,6 @@ bool IsSingleVarint(const std::string& s) {
   return slice.size() == 0;
 }
 
-#ifdef OS_LINUX
 bool IsUniqueIDValid(const std::string& s) {
   return !s.empty() && !IsSingleVarint(s);
 }
@@ -198,11 +420,22 @@ bool IsUniqueIDValid(const std::string& s) {
 const size_t MAX_ID_SIZE = 100;
 char temp_id[MAX_ID_SIZE];
 
+std::string GetOnDiskTestDir() {
+  char base[100];
+  snprintf(base, sizeof(base), "/tmp/rocksdbtest-%d",
+           static_cast<int>(geteuid()));
+  // Directory may already exist
+  Env::Default()->CreateDirIfMissing(base);
+
+  return base;
+}
+}  // namespace
+
 // Only works in linux platforms
 TEST(EnvPosixTest, RandomAccessUniqueID) {
   // Create file.
   const EnvOptions soptions;
-  std::string fname = test::TmpDir() + "/" + "testfile";
+  std::string fname = GetOnDiskTestDir() + "/" + "testfile";
   unique_ptr<WritableFile> wfile;
   ASSERT_OK(env_->NewWritableFile(fname, &wfile, soptions));
 
@@ -238,6 +471,44 @@ TEST(EnvPosixTest, RandomAccessUniqueID) {
   env_->DeleteFile(fname);
 }
 
+// only works in linux platforms
+#ifdef ROCKSDB_FALLOCATE_PRESENT
+TEST(EnvPosixTest, AllocateTest) {
+  std::string fname = GetOnDiskTestDir() + "/preallocate_testfile";
+  EnvOptions soptions;
+  soptions.use_mmap_writes = false;
+  unique_ptr<WritableFile> wfile;
+  ASSERT_OK(env_->NewWritableFile(fname, &wfile, soptions));
+
+  // allocate 100 MB
+  size_t kPreallocateSize = 100 * 1024 * 1024;
+  size_t kBlockSize = 512;
+  std::string data = "test";
+  wfile->SetPreallocationBlockSize(kPreallocateSize);
+  ASSERT_OK(wfile->Append(Slice(data)));
+  ASSERT_OK(wfile->Flush());
+
+  struct stat f_stat;
+  stat(fname.c_str(), &f_stat);
+  ASSERT_EQ((unsigned int)data.size(), f_stat.st_size);
+  // verify that blocks are preallocated
+  // Note here that we don't check the exact number of blocks preallocated --
+  // we only require that number of allocated blocks is at least what we expect.
+  // It looks like some FS give us more blocks that we asked for. That's fine.
+  // It might be worth investigating further.
+  auto st_blocks = f_stat.st_blocks;
+  ASSERT_LE((unsigned int)(kPreallocateSize / kBlockSize), st_blocks);
+
+  // close the file, should deallocate the blocks
+  wfile.reset();
+
+  stat(fname.c_str(), &f_stat);
+  ASSERT_EQ((unsigned int)data.size(), f_stat.st_size);
+  // verify that preallocated blocks were deallocated on file close
+  ASSERT_GT(st_blocks, f_stat.st_blocks);
+}
+#endif
+
 // Returns true if any of the strings in ss are the prefix of another string.
 bool HasPrefix(const std::unordered_set<std::string>& ss) {
   for (const std::string& s: ss) {
@@ -261,7 +532,7 @@ TEST(EnvPosixTest, RandomAccessUniqueIDConcurrent) {
   // Create the files
   std::vector<std::string> fnames;
   for (int i = 0; i < 1000; ++i) {
-    fnames.push_back(test::TmpDir() + "/" + "testfile" + std::to_string(i));
+    fnames.push_back(GetOnDiskTestDir() + "/" + "testfile" + std::to_string(i));
 
     // Create file.
     unique_ptr<WritableFile> wfile;
@@ -294,7 +565,8 @@ TEST(EnvPosixTest, RandomAccessUniqueIDConcurrent) {
 // Only works in linux platforms
 TEST(EnvPosixTest, RandomAccessUniqueIDDeletes) {
   const EnvOptions soptions;
-  std::string fname = test::TmpDir() + "/" + "testfile";
+
+  std::string fname = GetOnDiskTestDir() + "/" + "testfile";
 
   // Check that after file is deleted we don't get same ID again in a new file.
   std::unordered_set<std::string> ids;
@@ -388,6 +660,78 @@ TEST(EnvPosixTest, PosixRandomRWFileTest) {
   ASSERT_OK(file.get()->Read(100, 16, &result, scratch));
   ASSERT_EQ(result.compare("HelloHello world"), 0);
   ASSERT_OK(file.get()->Close());
+}
+
+class TestLogger : public Logger {
+ public:
+  virtual void Logv(const char* format, va_list ap) override {
+    log_count++;
+
+    char new_format[550];
+    std::fill_n(new_format, sizeof(new_format), '2');
+    {
+      va_list backup_ap;
+      va_copy(backup_ap, ap);
+      int n = vsnprintf(new_format, sizeof(new_format) - 1, format, backup_ap);
+      // 48 bytes for extra information + bytes allocated
+
+      if (new_format[0] == '[') {
+        // "[DEBUG] "
+        ASSERT_TRUE(n <= 56 + (512 - static_cast<int>(sizeof(struct timeval))));
+      } else {
+        ASSERT_TRUE(n <= 48 + (512 - static_cast<int>(sizeof(struct timeval))));
+      }
+      va_end(backup_ap);
+    }
+
+    for (size_t i = 0; i < sizeof(new_format); i++) {
+      if (new_format[i] == 'x') {
+        char_x_count++;
+      } else if (new_format[i] == '\0') {
+        char_0_count++;
+      }
+    }
+  }
+  int log_count;
+  int char_x_count;
+  int char_0_count;
+};
+
+TEST(EnvPosixTest, LogBufferTest) {
+  TestLogger test_logger;
+  test_logger.SetInfoLogLevel(InfoLogLevel::INFO_LEVEL);
+  test_logger.log_count = 0;
+  test_logger.char_x_count = 0;
+  test_logger.char_0_count = 0;
+  LogBuffer log_buffer(InfoLogLevel::INFO_LEVEL, &test_logger);
+  LogBuffer log_buffer_debug(DEBUG_LEVEL, &test_logger);
+
+  char bytes200[200];
+  std::fill_n(bytes200, sizeof(bytes200), '1');
+  bytes200[sizeof(bytes200) - 1] = '\0';
+  char bytes600[600];
+  std::fill_n(bytes600, sizeof(bytes600), '1');
+  bytes600[sizeof(bytes600) - 1] = '\0';
+  char bytes9000[9000];
+  std::fill_n(bytes9000, sizeof(bytes9000), '1');
+  bytes9000[sizeof(bytes9000) - 1] = '\0';
+
+  LogToBuffer(&log_buffer, "x%sx", bytes200);
+  LogToBuffer(&log_buffer, "x%sx", bytes600);
+  LogToBuffer(&log_buffer, "x%sx%sx%sx", bytes200, bytes200, bytes200);
+  LogToBuffer(&log_buffer, "x%sx%sx", bytes200, bytes600);
+  LogToBuffer(&log_buffer, "x%sx%sx", bytes600, bytes9000);
+
+  LogToBuffer(&log_buffer_debug, "x%sx", bytes200);
+  test_logger.SetInfoLogLevel(DEBUG_LEVEL);
+  LogToBuffer(&log_buffer_debug, "x%sx%sx%sx", bytes600, bytes9000, bytes200);
+
+  ASSERT_EQ(0, test_logger.log_count);
+  log_buffer.FlushBufferToLog();
+  log_buffer_debug.FlushBufferToLog();
+  ASSERT_EQ(6, test_logger.log_count);
+  ASSERT_EQ(6, test_logger.char_0_count);
+  ASSERT_EQ(10, test_logger.char_x_count);
 }
 
 }  // namespace rocksdb

@@ -23,42 +23,63 @@
 #include <set>
 #include <vector>
 #include <deque>
+#include <atomic>
+#include <limits>
 #include "db/dbformat.h"
 #include "db/version_edit.h"
 #include "port/port.h"
 #include "db/table_cache.h"
+#include "db/compaction.h"
+#include "db/compaction_picker.h"
+#include "db/column_family.h"
+#include "db/log_reader.h"
+#include "db/file_indexer.h"
 
 namespace rocksdb {
 
 namespace log { class Writer; }
 
 class Compaction;
+class CompactionPicker;
 class Iterator;
+class LogBuffer;
+class LookupKey;
 class MemTable;
-class TableCache;
 class Version;
 class VersionSet;
 class MergeContext;
+class ColumnFamilyData;
+class ColumnFamilySet;
+class TableCache;
+class MergeIteratorBuilder;
 
-// Return the smallest index i such that files[i]->largest >= key.
-// Return files.size() if there is no such file.
-// REQUIRES: "files" contains a sorted list of non-overlapping files.
+// Return the smallest index i such that file_level.files[i]->largest >= key.
+// Return file_level.num_files if there is no such file.
+// REQUIRES: "file_level.files" contains a sorted list of
+// non-overlapping files.
 extern int FindFile(const InternalKeyComparator& icmp,
-                    const std::vector<FileMetaData*>& files,
+                    const FileLevel& file_level,
                     const Slice& key);
 
 // Returns true iff some file in "files" overlaps the user key range
 // [*smallest,*largest].
 // smallest==nullptr represents a key smaller than all keys in the DB.
 // largest==nullptr represents a key largest than all keys in the DB.
-// REQUIRES: If disjoint_sorted_files, files[] contains disjoint ranges
-//           in sorted order.
+// REQUIRES: If disjoint_sorted_files, file_level.files[]
+// contains disjoint ranges in sorted order.
 extern bool SomeFileOverlapsRange(
     const InternalKeyComparator& icmp,
     bool disjoint_sorted_files,
-    const std::vector<FileMetaData*>& files,
+    const FileLevel& file_level,
     const Slice* smallest_user_key,
     const Slice* largest_user_key);
+
+// Generate FileLevel from vector<FdWithKeyRange*>
+// Would copy smallest_key and largest_key data to sequential memory
+// arena: Arena used to allocate the memory
+extern void DoGenerateFileLevel(FileLevel* file_level,
+        const std::vector<FileMetaData*>& files,
+        Arena* arena);
 
 class Version {
  public:
@@ -68,28 +89,45 @@ class Version {
   void AddIterators(const ReadOptions&, const EnvOptions& soptions,
                     std::vector<Iterator*>* iters);
 
+  void AddIterators(const ReadOptions&, const EnvOptions& soptions,
+                    MergeIteratorBuilder* merger_iter_builder);
+
   // Lookup the value for key.  If found, store it in *val and
-  // return OK.  Else return a non-OK status.  Fills *stats.
+  // return OK.  Else return a non-OK status.
   // Uses *operands to store merge_operator operations to apply later
   // REQUIRES: lock is not held
-  struct GetStats {
-    FileMetaData* seek_file;
-    int seek_file_level;
-  };
   void Get(const ReadOptions&, const LookupKey& key, std::string* val,
            Status* status, MergeContext* merge_context,
-           GetStats* stats, const Options& db_option, bool* value_found =
-               nullptr);
+           bool* value_found = nullptr);
 
-  // Adds "stats" into the current state.  Returns true if a new
-  // compaction may need to be triggered, false otherwise.
-  // REQUIRES: lock is held
-  bool UpdateStats(const GetStats& stats);
+  // Updates internal structures that keep track of compaction scores
+  // We use compaction scores to figure out which compaction to do next
+  // REQUIRES: If Version is not yet saved to current_, it can be called without
+  // a lock. Once a version is saved to current_, call only with mutex held
+  void ComputeCompactionScore(std::vector<uint64_t>& size_being_compacted);
+
+  // Generate file_levels_ from files_
+  void GenerateFileLevels();
+
+  // Update scores, pre-calculated variables. It needs to be called before
+  // applying the version to the version set.
+  void PrepareApply(std::vector<uint64_t>& size_being_compacted);
 
   // Reference count management (so Versions do not disappear out from
   // under live iterators)
   void Ref();
-  void Unref();
+  // Decrease reference count. Delete the object if no reference left
+  // and return true. Otherwise, return false.
+  bool Unref();
+
+  // Returns true iff some level needs a compaction.
+  bool NeedsCompaction() const;
+
+  // Returns the maxmimum compaction score for levels 1 to max
+  double MaxCompactionScore() const { return max_compaction_score_; }
+
+  // See field declaration
+  int MaxCompactionScoreLevel() const { return max_compaction_score_level_; }
 
   void GetOverlappingInputs(
       int level,
@@ -135,29 +173,124 @@ class Version {
   int PickLevelForMemTableOutput(const Slice& smallest_user_key,
                                  const Slice& largest_user_key);
 
-  int NumFiles(int level) const { return files_[level].size(); }
+  int NumberLevels() const { return num_levels_; }
+
+  // REQUIRES: lock is held
+  int NumLevelFiles(int level) const { return files_[level].size(); }
+
+  // Return the combined file size of all files at the specified level.
+  int64_t NumLevelBytes(int level) const;
+
+  // Return a human-readable short (single-line) summary of the number
+  // of files per level.  Uses *scratch as backing store.
+  struct LevelSummaryStorage {
+    char buffer[100];
+  };
+  struct FileSummaryStorage {
+    char buffer[1000];
+  };
+  const char* LevelSummary(LevelSummaryStorage* scratch) const;
+  // Return a human-readable short (single-line) summary of files
+  // in a specified level.  Uses *scratch as backing store.
+  const char* LevelFileSummary(FileSummaryStorage* scratch, int level) const;
+
+  // Return the maximum overlapping data (in bytes) at next level for any
+  // file at a level >= 1.
+  int64_t MaxNextLevelOverlappingBytes();
+
+  // Add all files listed in the current version to *live.
+  void AddLiveFiles(std::vector<FileDescriptor>* live);
 
   // Return a human readable string that describes this version's contents.
   std::string DebugString(bool hex = false) const;
 
   // Returns the version nuber of this version
-  uint64_t GetVersionNumber() {
-    return version_number_;
+  uint64_t GetVersionNumber() const { return version_number_; }
+
+  uint64_t GetAverageValueSize() const {
+    if (num_non_deletions_ == 0) {
+      return 0;
+    }
+    assert(total_raw_key_size_ + total_raw_value_size_ > 0);
+    assert(total_file_size_ > 0);
+    return total_raw_value_size_ / num_non_deletions_ * total_file_size_ /
+           (total_raw_key_size_ + total_raw_value_size_);
   }
+
+  // REQUIRES: lock is held
+  // On success, "tp" will contains the table properties of the file
+  // specified in "file_meta".  If the file name of "file_meta" is
+  // known ahread, passing it by a non-null "fname" can save a
+  // file-name conversion.
+  Status GetTableProperties(std::shared_ptr<const TableProperties>* tp,
+                            const FileMetaData* file_meta,
+                            const std::string* fname = nullptr);
+
+  // REQUIRES: lock is held
+  // On success, *props will be populated with all SSTables' table properties.
+  // The keys of `props` are the sst file name, the values of `props` are the
+  // tables' propertis, represented as shared_ptr.
+  Status GetPropertiesOfAllTables(TablePropertiesCollection* props);
+
+  uint64_t GetEstimatedActiveKeys();
+
+  size_t GetMemoryUsageByTableReaders();
+
+  // used to sort files by size
+  struct Fsize {
+    int index;
+    FileMetaData* file;
+  };
 
  private:
   friend class Compaction;
   friend class VersionSet;
   friend class DBImpl;
+  friend class ColumnFamilyData;
+  friend class CompactionPicker;
+  friend class LevelCompactionPicker;
+  friend class UniversalCompactionPicker;
+  friend class FIFOCompactionPicker;
+  friend class ForwardIterator;
+  friend class InternalStats;
 
   class LevelFileNumIterator;
-  Iterator* NewConcatenatingIterator(const ReadOptions&,
-                                     const EnvOptions& soptions,
-                                     int level) const;
-  bool PrefixMayMatch(const ReadOptions& options, const EnvOptions& soptions,
-                      const Slice& internal_prefix, Iterator* level_iter) const;
+  class LevelFileIteratorState;
 
+  bool PrefixMayMatch(const ReadOptions& options, Iterator* level_iter,
+                      const Slice& internal_prefix) const;
+
+  // Update num_non_empty_levels_.
+  void UpdateNumNonEmptyLevels();
+
+  // The helper function of UpdateTemporaryStats, which may fill the missing
+  // fields of file_mata from its associated TableProperties.
+  // Returns true if it does initialize FileMetaData.
+  bool MaybeInitializeFileMetaData(FileMetaData* file_meta);
+
+  // Update the temporary stats associated with the current version.
+  // This temporary stats will be used in compaction.
+  void UpdateTemporaryStats();
+
+  // Sort all files for this version based on their file size and
+  // record results in files_by_size_. The largest files are listed first.
+  void UpdateFilesBySize();
+
+  ColumnFamilyData* cfd_;  // ColumnFamilyData to which this Version belongs
+  const InternalKeyComparator* internal_comparator_;
+  const Comparator* user_comparator_;
+  TableCache* table_cache_;
+  const MergeOperator* merge_operator_;
+
+  autovector<FileLevel> file_levels_;   // A copy of list of files per level
+  Logger* info_log_;
+  Statistics* db_statistics_;
+  int num_levels_;              // Number of levels
+  int num_non_empty_levels_;    // Number of levels. Any level larger than it
+                                // is guaranteed to be empty.
+  FileIndexer file_indexer_;
   VersionSet* vset_;            // VersionSet to which this Version belongs
+  Arena arena_;                 // Used to allocate space for file_levels_
   Version* next_;               // Next version in linked list
   Version* prev_;               // Previous version in linked list
   int refs_;                    // Number of live refs to this version
@@ -170,7 +303,7 @@ class Version {
   // but files in each level are now sorted based on file
   // size. The file with the largest size is at the front.
   // This vector stores the index of the file from files_.
-  std::vector< std::vector<int> > files_by_size_;
+  std::vector<std::vector<int>> files_by_size_;
 
   // An index into files_by_size_ that specifies the first
   // file that is not yet compacted
@@ -181,11 +314,7 @@ class Version {
   // that on a running system, we need to look at only the first
   // few largest files because a new version is created every few
   // seconds/minutes (because of concurrent compactions).
-  static const int number_of_files_to_sort_ = 50;
-
-  // Next file to compact based on seek stats.
-  FileMetaData* file_to_compact_;
-  int file_to_compact_level_;
+  static const size_t number_of_files_to_sort_ = 50;
 
   // Level that should be compacted next and its compaction score.
   // Score < 1 means compaction is not strictly needed.  These fields
@@ -197,14 +326,22 @@ class Version {
   double max_compaction_score_; // max score in l1 to ln-1
   int max_compaction_score_level_; // level on which max score occurs
 
-  // The offset in the manifest file where this version is stored.
-  uint64_t offset_manifest_file_;
-
   // A version number that uniquely represents this version. This is
   // used for debugging and logging purposes only.
   uint64_t version_number_;
 
-  explicit Version(VersionSet* vset, uint64_t version_number = 0);
+  Version(ColumnFamilyData* cfd, VersionSet* vset, uint64_t version_number = 0);
+
+  // total file size
+  uint64_t total_file_size_;
+  // the total size of all raw keys.
+  uint64_t total_raw_key_size_;
+  // the total size of all raw values.
+  uint64_t total_raw_value_size_;
+  // total number of non-deletion entries
+  uint64_t num_non_deletions_;
+  // total number of deletion entries
+  uint64_t num_deletions_;
 
   ~Version();
 
@@ -221,37 +358,60 @@ class Version {
 
 class VersionSet {
  public:
-  VersionSet(const std::string& dbname,
-             const Options* options,
-             const EnvOptions& storage_options,
-             TableCache* table_cache,
-             const InternalKeyComparator*);
+  VersionSet(const std::string& dbname, const DBOptions* options,
+             const EnvOptions& storage_options, Cache* table_cache);
   ~VersionSet();
 
   // Apply *edit to the current version to form a new descriptor that
   // is both saved to persistent state and installed as the new
   // current version.  Will release *mu while actually writing to the file.
+  // column_family_options has to be set if edit is column family add
   // REQUIRES: *mu is held on entry.
   // REQUIRES: no other thread concurrently calls LogAndApply()
-  Status LogAndApply(VersionEdit* edit, port::Mutex* mu,
-      bool new_descriptor_log = false);
+  Status LogAndApply(ColumnFamilyData* column_family_data, VersionEdit* edit,
+                     port::Mutex* mu, Directory* db_directory = nullptr,
+                     bool new_descriptor_log = false,
+                     const ColumnFamilyOptions* column_family_options =
+                         nullptr);
 
   // Recover the last saved descriptor from persistent storage.
-  Status Recover();
+  // If read_only == true, Recover() will not complain if some column families
+  // are not opened
+  Status Recover(const std::vector<ColumnFamilyDescriptor>& column_families,
+                 bool read_only = false);
 
+  // Reads a manifest file and returns a list of column families in
+  // column_families.
+  static Status ListColumnFamilies(std::vector<std::string>* column_families,
+                                   const std::string& dbname, Env* env);
+
+#ifndef ROCKSDB_LITE
   // Try to reduce the number of levels. This call is valid when
   // only one level from the new max level to the old
   // max level containing files.
+  // The call is static, since number of levels is immutable during
+  // the lifetime of a RocksDB instance. It reduces number of levels
+  // in a DB by applying changes to manifest.
   // For example, a db currently has 7 levels [0-6], and a call to
   // to reduce to 5 [0-4] can only be executed when only one level
   // among [4-6] contains files.
-  Status ReduceNumberOfLevels(int new_levels, port::Mutex* mu);
+  static Status ReduceNumberOfLevels(const std::string& dbname,
+                                     const Options* options,
+                                     const EnvOptions& storage_options,
+                                     int new_levels);
 
-  // Return the current version.
-  Version* current() const { return current_; }
+  // printf contents (for debugging)
+  Status DumpManifest(Options& options, std::string& manifestFileName,
+                      bool verbose, bool hex = false);
+
+#endif  // ROCKSDB_LITE
 
   // Return the current manifest file number
   uint64_t ManifestFileNumber() const { return manifest_file_number_; }
+
+  uint64_t PendingManifestFileNumber() const {
+    return pending_manifest_file_number_;
+  }
 
   // Allocate and return a new file number
   uint64_t NewFileNumber() { return next_file_number_++; }
@@ -259,17 +419,11 @@ class VersionSet {
   // Arrange to reuse "file_number" unless a newer file number has
   // already been allocated.
   // REQUIRES: "file_number" was returned by a call to NewFileNumber().
-  void ReuseFileNumber(uint64_t file_number) {
+  void ReuseLogFileNumber(uint64_t file_number) {
     if (next_file_number_ == file_number + 1) {
       next_file_number_ = file_number;
     }
   }
-
-  // Return the number of Table files at the specified level.
-  int NumLevelFiles(int level) const;
-
-  // Return the combined file size of all files at the specified level.
-  int64_t NumLevelBytes(int level) const;
 
   // Return the last sequence number.
   uint64_t LastSequence() const {
@@ -285,127 +439,35 @@ class VersionSet {
   // Mark the specified file number as used.
   void MarkFileNumberUsed(uint64_t number);
 
-  // Return the current log file number.
-  uint64_t LogNumber() const { return log_number_; }
-
   // Return the log file number for the log file that is currently
   // being compacted, or zero if there is no such log file.
   uint64_t PrevLogNumber() const { return prev_log_number_; }
 
-  int NumberLevels() const { return num_levels_; }
-
-  // Pick level and inputs for a new compaction.
-  // Returns nullptr if there is no compaction to be done.
-  // Otherwise returns a pointer to a heap-allocated object that
-  // describes the compaction.  Caller should delete the result.
-  Compaction* PickCompaction();
-
-  // Return a compaction object for compacting the range [begin,end] in
-  // the specified level.  Returns nullptr if there is nothing in that
-  // level that overlaps the specified range.  Caller should delete
-  // the result.
-  Compaction* CompactRange(
-      int level,
-      const InternalKey* begin,
-      const InternalKey* end);
-
-  // Return the maximum overlapping data (in bytes) at next level for any
-  // file at a level >= 1.
-  int64_t MaxNextLevelOverlappingBytes();
+  // Returns the minimum log number such that all
+  // log numbers less than or equal to it can be deleted
+  uint64_t MinLogNumber() const {
+    uint64_t min_log_num = std::numeric_limits<uint64_t>::max();
+    for (auto cfd : *column_family_set_) {
+      if (min_log_num > cfd->GetLogNumber()) {
+        min_log_num = cfd->GetLogNumber();
+      }
+    }
+    return min_log_num;
+  }
 
   // Create an iterator that reads over the compaction inputs for "*c".
   // The caller should delete the iterator when no longer needed.
   Iterator* MakeInputIterator(Compaction* c);
 
-  // Returns true iff some level needs a compaction because it has
-  // exceeded its target size.
-  bool NeedsSizeCompaction() const {
-    // In universal compaction case, this check doesn't really
-    // check the compaction condition, but checks num of files threshold
-    // only. We are not going to miss any compaction opportunity
-    // but it's likely that more compactions are scheduled but
-    // ending up with nothing to do. We can improve it later.
-    // TODO: improve this function to be accurate for universal
-    //       compactions.
-    int num_levels_to_check =
-        (options_->compaction_style != kCompactionStyleUniversal) ?
-            NumberLevels() - 1 : 1;
-    for (int i = 0; i < num_levels_to_check; i++) {
-      if (current_->compaction_score_[i] >= 1) {
-        return true;
-      }
-    }
-    return false;
-  }
-  // Returns true iff some level needs a compaction.
-  bool NeedsCompaction() const {
-    return ((current_->file_to_compact_ != nullptr) ||
-            NeedsSizeCompaction());
-  }
-
-  // Returns the maxmimum compaction score for levels 1 to max
-  double MaxCompactionScore() const {
-    return current_->max_compaction_score_;
-  }
-
-  // See field declaration
-  int MaxCompactionScoreLevel() const {
-    return current_->max_compaction_score_level_;
-  }
-
   // Add all files listed in any live version to *live.
-  void AddLiveFiles(std::vector<uint64_t>* live_list);
-
-  // Add all files listed in the current version to *live.
-  void AddLiveFilesCurrentVersion(std::set<uint64_t>* live);
+  void AddLiveFiles(std::vector<FileDescriptor>* live_list);
 
   // Return the approximate offset in the database of the data for
   // "key" as of version "v".
   uint64_t ApproximateOffsetOf(Version* v, const InternalKey& key);
 
-  // Return a human-readable short (single-line) summary of the number
-  // of files per level.  Uses *scratch as backing store.
-  struct LevelSummaryStorage {
-    char buffer[100];
-  };
-  struct FileSummaryStorage {
-    char buffer[1000];
-  };
-  const char* LevelSummary(LevelSummaryStorage* scratch) const;
-
-  // printf contents (for debugging)
-  Status DumpManifest(Options& options, std::string& manifestFileName,
-                      bool verbose, bool hex = false);
-
-  // Return a human-readable short (single-line) summary of the data size
-  // of files per level.  Uses *scratch as backing store.
-  const char* LevelDataSizeSummary(LevelSummaryStorage* scratch) const;
-
-  // Return a human-readable short (single-line) summary of files
-  // in a specified level.  Uses *scratch as backing store.
-  const char* LevelFileSummary(FileSummaryStorage* scratch, int level) const;
-
   // Return the size of the current manifest file
-  const uint64_t ManifestFileSize() { return current_->offset_manifest_file_; }
-
-  // For the specfied level, pick a compaction.
-  // Returns nullptr if there is no compaction to be done.
-  // If level is 0 and there is already a compaction on that level, this
-  // function will return nullptr.
-  Compaction* PickCompactionBySize(int level, double score);
-
-  // Pick files to compact in Universal mode
-  Compaction* PickCompactionUniversal(int level, double score);
-
-  // Pick Universal compaction to limit read amplification
-  Compaction* PickCompactionUniversalReadAmp(int level, double score,
-                unsigned int ratio, unsigned int num_files);
-
-  // Pick Universal compaction to limit space amplification.
-  Compaction* PickCompactionUniversalSizeAmp(int level, double score);
-
-  // Free up the files that were participated in a compaction
-  void ReleaseCompactionFiles(Compaction* c, Status status);
+  uint64_t ManifestFileSize() const { return manifest_file_size_; }
 
   // verify that the files that we started with for a compaction
   // still exist in the current version and in the same original level.
@@ -413,94 +475,53 @@ class VersionSet {
   // pick the same files to compact.
   bool VerifyCompactionFileConsistency(Compaction* c);
 
-  // used to sort files by size
-  typedef struct fsize {
-    int index;
-    FileMetaData* file;
-  } Fsize;
-
-  // Sort all files for this version based on their file size and
-  // record results in files_by_size_. The largest files are listed first.
-  void UpdateFilesBySize(Version *v);
-
-  // Get the max file size in a given level.
-  uint64_t MaxFileSizeForLevel(int level);
-
-  double MaxBytesForLevel(int level);
-
-  Status GetMetadataForFile(
-    uint64_t number, int *filelevel, FileMetaData *metadata);
+  Status GetMetadataForFile(uint64_t number, int* filelevel,
+                            FileMetaData** metadata, ColumnFamilyData** cfd);
 
   void GetLiveFilesMetaData(
     std::vector<LiveFileMetaData> *metadata);
 
   void GetObsoleteFiles(std::vector<FileMetaData*>* files);
 
+  ColumnFamilySet* GetColumnFamilySet() { return column_family_set_.get(); }
+
  private:
   class Builder;
   struct ManifestWriter;
 
-  friend class Compaction;
   friend class Version;
 
-  void Init(int num_levels);
-
-  void Finalize(Version* v, std::vector<uint64_t>&);
-
-  void GetRange(const std::vector<FileMetaData*>& inputs,
-                InternalKey* smallest,
-                InternalKey* largest);
-
-  void GetRange2(const std::vector<FileMetaData*>& inputs1,
-                 const std::vector<FileMetaData*>& inputs2,
-                 InternalKey* smallest,
-                 InternalKey* largest);
-
-  void ExpandWhileOverlapping(Compaction* c);
-
-  void SetupOtherInputs(Compaction* c);
+  struct LogReporter : public log::Reader::Reporter {
+    Status* status;
+    virtual void Corruption(size_t bytes, const Status& s) {
+      if (this->status->ok()) *this->status = s;
+    }
+  };
 
   // Save current contents to *log
   Status WriteSnapshot(log::Writer* log);
 
-  void AppendVersion(Version* v);
+  void AppendVersion(ColumnFamilyData* column_family_data, Version* v);
 
-  bool ManifestContains(const std::string& record) const;
+  bool ManifestContains(uint64_t manifest_file_number,
+                        const std::string& record) const;
 
-  uint64_t ExpandedCompactionByteSizeLimit(int level);
+  ColumnFamilyData* CreateColumnFamily(const ColumnFamilyOptions& options,
+                                       VersionEdit* edit);
 
-  uint64_t MaxGrandParentOverlapBytes(int level);
+  std::unique_ptr<ColumnFamilySet> column_family_set_;
 
   Env* const env_;
   const std::string dbname_;
-  const Options* const options_;
-  TableCache* const table_cache_;
-  const InternalKeyComparator icmp_;
+  const DBOptions* const options_;
   uint64_t next_file_number_;
   uint64_t manifest_file_number_;
+  uint64_t pending_manifest_file_number_;
   std::atomic<uint64_t> last_sequence_;
-  uint64_t log_number_;
   uint64_t prev_log_number_;  // 0 or backing store for memtable being compacted
-
-  int num_levels_;
 
   // Opened lazily
   unique_ptr<log::Writer> descriptor_log_;
-  Version dummy_versions_;  // Head of circular doubly-linked list of versions.
-  Version* current_;        // == dummy_versions_.prev_
-
-  // Per-level key at which the next compaction at that level should start.
-  // Either an empty string, or a valid InternalKey.
-  std::string* compact_pointer_;
-
-  // Per-level target file size.
-  uint64_t* max_file_size_;
-
-  // Per-level max bytes
-  uint64_t* level_max_bytes_;
-
-  // record all the ongoing compactions for all levels
-  std::vector<std::set<Compaction*> > compactions_in_progress_;
 
   // generates a increasing version number for every new version
   uint64_t current_version_number_;
@@ -508,9 +529,8 @@ class VersionSet {
   // Queue of writers to the manifest file
   std::deque<ManifestWriter*> manifest_writers_;
 
-  // Store the manifest file size when it is checked.
-  // Save us the cost of checking file size twice in LogAndApply
-  uint64_t last_observed_manifest_size_;
+  // Current size of manifest file
+  uint64_t manifest_file_size_;
 
   std::vector<FileMetaData*> obsolete_files_;
 
@@ -525,133 +545,9 @@ class VersionSet {
   VersionSet(const VersionSet&);
   void operator=(const VersionSet&);
 
-  // Return the total amount of data that is undergoing
-  // compactions per level
-  void SizeBeingCompacted(std::vector<uint64_t>&);
-
-  // Returns true if any one of the parent files are being compacted
-  bool ParentRangeInCompaction(const InternalKey* smallest,
-    const InternalKey* largest, int level, int* index);
-
-  // Returns true if any one of the specified files are being compacted
-  bool FilesInCompaction(std::vector<FileMetaData*>& files);
-
-  void LogAndApplyHelper(Builder*b, Version* v,
-                           VersionEdit* edit, port::Mutex* mu);
-};
-
-// A Compaction encapsulates information about a compaction.
-class Compaction {
- public:
-  ~Compaction();
-
-  // Return the level that is being compacted.  Inputs from "level"
-  // will be merged.
-  int level() const { return level_; }
-
-  // Outputs will go to this level
-  int output_level() const { return out_level_; }
-
-  // Return the object that holds the edits to the descriptor done
-  // by this compaction.
-  VersionEdit* edit() { return edit_; }
-
-  // "which" must be either 0 or 1
-  int num_input_files(int which) const { return inputs_[which].size(); }
-
-  // Return the ith input file at "level()+which" ("which" must be 0 or 1).
-  FileMetaData* input(int which, int i) const { return inputs_[which][i]; }
-
-  // Maximum size of files to build during this compaction.
-  uint64_t MaxOutputFileSize() const { return max_output_file_size_; }
-
-  // Whether compression will be enabled for compaction outputs
-  bool enable_compression() const { return enable_compression_; }
-
-  // Is this a trivial compaction that can be implemented by just
-  // moving a single input file to the next level (no merging or splitting)
-  bool IsTrivialMove() const;
-
-  // Add all inputs to this compaction as delete operations to *edit.
-  void AddInputDeletions(VersionEdit* edit);
-
-  // Returns true if the information we have available guarantees that
-  // the compaction is producing data in "level+1" for which no data exists
-  // in levels greater than "level+1".
-  bool IsBaseLevelForKey(const Slice& user_key);
-
-  // Returns true iff we should stop building the current output
-  // before processing "internal_key".
-  bool ShouldStopBefore(const Slice& internal_key);
-
-  // Release the input version for the compaction, once the compaction
-  // is successful.
-  void ReleaseInputs();
-
-  void Summary(char* output, int len);
-
-  // Return the score that was used to pick this compaction run.
-  double score() const { return score_; }
-
-  // Is this compaction creating a file in the bottom most level?
-  bool BottomMostLevel() { return bottommost_level_; }
-
-  // Does this compaction include all sst files?
-  bool IsFullCompaction() { return is_full_compaction_; }
-
- private:
-  friend class Version;
-  friend class VersionSet;
-
-  explicit Compaction(int level, int out_level, uint64_t target_file_size,
-    uint64_t max_grandparent_overlap_bytes, int number_levels,
-    bool seek_compaction = false, bool enable_compression = true);
-
-  int level_;
-  int out_level_; // levels to which output files are stored
-  uint64_t max_output_file_size_;
-  uint64_t maxGrandParentOverlapBytes_;
-  Version* input_version_;
-  VersionEdit* edit_;
-  int number_levels_;
-
-  bool seek_compaction_;
-  bool enable_compression_;
-
-  // Each compaction reads inputs from "level_" and "level_+1"
-  std::vector<FileMetaData*> inputs_[2];      // The two sets of inputs
-
-  // State used to check for number of of overlapping grandparent files
-  // (parent == level_ + 1, grandparent == level_ + 2)
-  std::vector<FileMetaData*> grandparents_;
-  size_t grandparent_index_;  // Index in grandparent_starts_
-  bool seen_key_;             // Some output key has been seen
-  uint64_t overlapped_bytes_;  // Bytes of overlap between current output
-                              // and grandparent files
-  int base_index_;   // index of the file in files_[level_]
-  int parent_index_; // index of some file with same range in files_[level_+1]
-  double score_;     // score that was used to pick this compaction.
-
-  // Is this compaction creating a file in the bottom most level?
-  bool bottommost_level_;
-  // Does this compaction include all sst files?
-  bool is_full_compaction_;
-
-  // level_ptrs_ holds indices into input_version_->levels_: our state
-  // is that we are positioned at one of the file ranges for each
-  // higher level than the ones involved in this compaction (i.e. for
-  // all L >= level_ + 2).
-  std::vector<size_t> level_ptrs_;
-
-  // mark (or clear) all files that are being compacted
-  void MarkFilesBeingCompacted(bool);
-
-  // Initialize whether compaction producing files at the bottommost level
-  void SetupBottomMostLevel(bool isManual);
-
-  // In case of compaction error, reset the nextIndex that is used
-  // to pick up the next file to be compacted from files_by_size_
-  void ResetNextCompactionIndex();
+  void LogAndApplyCFHelper(VersionEdit* edit);
+  void LogAndApplyHelper(ColumnFamilyData* cfd, Builder* b, Version* v,
+                         VersionEdit* edit, port::Mutex* mu);
 };
 
 }  // namespace rocksdb

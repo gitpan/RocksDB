@@ -1,127 +1,200 @@
-//  Copyright (c) 2013, Facebook, Inc.  All rights reserved.
-//  This source code is licensed under the BSD-style license found in the
-//  LICENSE file in the root directory of this source tree. An additional grant
-//  of patent rights can be found in the PATENTS file in the same directory.
-//
 // Copyright (c) 2011 The LevelDB Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
+//
+// Currently we support two types of tables: plain table and block-based table.
+//   1. Block-based table: this is the default table type that we inherited from
+//      LevelDB, which was designed for storing data in hard disk or flash
+//      device.
+//   2. Plain table: it is one of RocksDB's SST file format optimized
+//      for low query latency on pure-memory or really low-latency media.
+//
+// A tutorial of rocksdb table formats is available here:
+//   https://github.com/facebook/rocksdb/wiki/A-Tutorial-of-RocksDB-SST-formats
+//
+// Example code is also available
+//   https://github.com/facebook/rocksdb/wiki/A-Tutorial-of-RocksDB-SST-formats#wiki-examples
 
 #pragma once
 #include <memory>
-#include <stdint.h>
+#include <string>
+#include <unordered_map>
+
 #include "rocksdb/env.h"
 #include "rocksdb/iterator.h"
-#include "rocksdb/table_properties.h"
 #include "rocksdb/options.h"
+#include "rocksdb/status.h"
 
 namespace rocksdb {
 
-struct Options;
+// -- Block-based Table
+class FlushBlockPolicyFactory;
 class RandomAccessFile;
-struct ReadOptions;
-class TableCache;
+class TableBuilder;
+class TableReader;
 class WritableFile;
+struct EnvOptions;
+struct Options;
 
 using std::unique_ptr;
 
-// TableBuilder provides the interface used to build a Table
-// (an immutable and sorted map from keys to values).
-//
-// Multiple threads can invoke const methods on a TableBuilder without
-// external synchronization, but if any of the threads may call a
-// non-const method, all threads accessing the same TableBuilder must use
-// external synchronization.
-class TableBuilder {
- public:
-  // REQUIRES: Either Finish() or Abandon() has been called.
-  virtual ~TableBuilder() {}
-
-  // Add key,value to the table being constructed.
-  // REQUIRES: key is after any previously added key according to comparator.
-  // REQUIRES: Finish(), Abandon() have not been called
-  virtual void Add(const Slice& key, const Slice& value) = 0;
-
-  // Return non-ok iff some error has been detected.
-  virtual Status status() const = 0;
-
-  // Finish building the table.
-  // REQUIRES: Finish(), Abandon() have not been called
-  virtual Status Finish() = 0;
-
-  // Indicate that the contents of this builder should be abandoned.
-  // If the caller is not going to call Finish(), it must call Abandon()
-  // before destroying this builder.
-  // REQUIRES: Finish(), Abandon() have not been called
-  virtual void Abandon() = 0;
-
-  // Number of calls to Add() so far.
-  virtual uint64_t NumEntries() const = 0;
-
-  // Size of the file generated so far.  If invoked after a successful
-  // Finish() call, returns the size of the final generated file.
-  virtual uint64_t FileSize() const = 0;
+enum ChecksumType : char {
+  kNoChecksum = 0x0,  // not yet supported. Will fail
+  kCRC32c = 0x1,
+  kxxHash = 0x2,
 };
 
-// A Table is a sorted map from strings to strings.  Tables are
-// immutable and persistent.  A Table may be safely accessed from
-// multiple threads without external synchronization.
-class TableReader {
- public:
-  virtual ~TableReader() {}
+// For advanced user only
+struct BlockBasedTableOptions {
+  // @flush_block_policy_factory creates the instances of flush block policy.
+  // which provides a configurable way to determine when to flush a block in
+  // the block based tables.  If not set, table builder will use the default
+  // block flush policy, which cut blocks by block size (please refer to
+  // `FlushBlockBySizePolicy`).
+  std::shared_ptr<FlushBlockPolicyFactory> flush_block_policy_factory;
 
-  // Determine whether there is a chance that the current table file
-  // contains the key a key starting with iternal_prefix. The specific
-  // table implementation can use bloom filter and/or other heuristic
-  // to filter out this table as a whole.
-  virtual bool PrefixMayMatch(const Slice& internal_prefix) = 0;
-
-  // Returns a new iterator over the table contents.
-  // The result of NewIterator() is initially invalid (caller must
-  // call one of the Seek methods on the iterator before using it).
-  virtual Iterator* NewIterator(const ReadOptions&) = 0;
-
-  // Given a key, return an approximate byte offset in the file where
-  // the data for that key begins (or would begin if the key were
-  // present in the file).  The returned value is in terms of file
-  // bytes, and so includes effects like compression of the underlying data.
-  // E.g., the approximate offset of the last key in the table will
-  // be close to the file length.
-  virtual uint64_t ApproximateOffsetOf(const Slice& key) = 0;
-
-  // Returns true if the block for the specified key is in cache.
-  // REQUIRES: key is in this table.
-  virtual bool TEST_KeyInCache(const ReadOptions& options,
-                               const Slice& key) = 0;
-
-  // Set up the table for Compaction. Might change some parameters with
-  // posix_fadvise
-  virtual void SetupForCompaction() = 0;
-
-  virtual TableProperties& GetTableProperties() = 0;
-
-  // Calls (*result_handler)(handle_context, ...) repeatedly, starting with
-  // the entry found after a call to Seek(key), until result_handler returns
-  // false, where k is the actual internal key for a row found and v as the
-  // value of the key. didIO is true if I/O is involved in the operation. May
-  // not make such a call if filter policy says that key is not present.
+  // TODO(kailiu) Temporarily disable this feature by making the default value
+  // to be false.
   //
-  // mark_key_may_exist_handler needs to be called when it is configured to be
-  // memory only and the key is not found in the block cache, with
-  // the parameter to be handle_context.
-  //
-  // readOptions is the options for the read
-  // key is the key to search for
-  virtual Status Get(
-      const ReadOptions& readOptions,
-      const Slice& key,
-      void* handle_context,
-      bool (*result_handler)(void* handle_context, const Slice& k,
-                             const Slice& v, bool didIO),
-      void (*mark_key_may_exist_handler)(void* handle_context) = nullptr) = 0;
+  // Indicating if we'd put index/filter blocks to the block cache.
+  // If not specified, each "table reader" object will pre-load index/filter
+  // block during table initialization.
+  bool cache_index_and_filter_blocks = false;
+
+  // The index type that will be used for this table.
+  enum IndexType : char {
+    // A space efficient index block that is optimized for
+    // binary-search-based index.
+    kBinarySearch,
+
+    // The hash index, if enabled, will do the hash lookup when
+    // `Options.prefix_extractor` is provided.
+    kHashSearch,
+  };
+
+  IndexType index_type = kBinarySearch;
+
+  // Influence the behavior when kHashSearch is used.
+  // if false, stores a precise prefix to block range mapping
+  // if true, does not store prefix and allows prefix hash collision
+  // (less memory consumption)
+  bool hash_index_allow_collision = true;
+
+  // Use the specified checksum type. Newly created table files will be
+  // protected with this checksum type. Old table files will still be readable,
+  // even though they have different checksum type.
+  ChecksumType checksum = kCRC32c;
 };
 
-// A base class for table factories
+// Table Properties that are specific to block-based table properties.
+struct BlockBasedTablePropertyNames {
+  // value of this propertis is a fixed int32 number.
+  static const std::string kIndexType;
+};
+
+// Create default block based table factory.
+extern TableFactory* NewBlockBasedTableFactory(
+    const BlockBasedTableOptions& table_options = BlockBasedTableOptions());
+
+#ifndef ROCKSDB_LITE
+
+enum EncodingType : char {
+  // Always write full keys without any special encoding.
+  kPlain,
+  // Find opportunity to write the same prefix once for multiple rows.
+  // In some cases, when a key follows a previous key with the same prefix,
+  // instead of writing out the full key, it just writes out the size of the
+  // shared prefix, as well as other bytes, to save some bytes.
+  //
+  // When using this option, the user is required to use the same prefix
+  // extractor to make sure the same prefix will be extracted from the same key.
+  // The Name() value of the prefix extractor will be stored in the file. When
+  // reopening the file, the name of the options.prefix_extractor given will be
+  // bitwise compared to the prefix extractors stored in the file. An error
+  // will be returned if the two don't match.
+  kPrefix,
+};
+
+// Table Properties that are specific to plain table properties.
+struct PlainTablePropertyNames {
+  static const std::string kPrefixExtractorName;
+  static const std::string kEncodingType;
+  static const std::string kBloomVersion;
+  static const std::string kNumBloomBlocks;
+};
+
+const uint32_t kPlainTableVariableLength = 0;
+
+struct PlainTableOptions {
+// @user_key_len: plain table has optimization for fix-sized keys, which can be
+//                specified via user_key_len.  Alternatively, you can pass
+//                `kPlainTableVariableLength` if your keys have variable
+//                lengths.
+uint32_t user_key_len = kPlainTableVariableLength;
+
+// @bloom_bits_per_key: the number of bits used for bloom filer per prefix. You
+//                      may disable it by passing a zero.
+int bloom_bits_per_key = 10;
+
+// @hash_table_ratio: the desired utilization of the hash table used for prefix
+//                    hashing. hash_table_ratio = number of prefixes / #buckets
+//                    in the hash table
+double hash_table_ratio = 0.75;
+
+// @index_sparseness: inside each prefix, need to build one index record for how
+//                    many keys for binary search inside each hash bucket.
+//                    For encoding type kPrefix, the value will be used when
+//                    writing to determine an interval to rewrite the full key.
+//                    It will also be used as a suggestion and satisfied when
+//                    possible.
+size_t index_sparseness = 16;
+
+// @huge_page_tlb_size: if <=0, allocate hash indexes and blooms from malloc.
+//                      Otherwise from huge page TLB. The user needs to reserve
+//                      huge pages for it to be allocated, like:
+//                          sysctl -w vm.nr_hugepages=20
+//                      See linux doc Documentation/vm/hugetlbpage.txt
+size_t huge_page_tlb_size = 0;
+
+// @encoding_type: how to encode the keys. See enum EncodingType above for
+//                 the choices. The value will determine how to encode keys
+//                 when writing to a new SST file. This value will be stored
+//                 inside the SST file which will be used when reading from the
+//                 file, which makes it possible for users to choose different
+//                 encoding type when reopening a DB. Files with different
+//                 encoding types can co-exist in the same DB and can be read.
+EncodingType encoding_type = kPlain;
+
+// @full_scan_mode: mode for reading the whole file one record by one without
+//                  using the index.
+  bool full_scan_mode = false;
+
+  // @store_index_in_file: compute plain table index and bloom filter during
+  //                       file building and store it in file. When reading
+  //                       file, index will be mmaped instead of recomputation.
+  bool store_index_in_file = false;
+};
+
+// -- Plain Table with prefix-only seek
+// For this factory, you need to set Options.prefix_extrator properly to make it
+// work. Look-up will starts with prefix hash lookup for key prefix. Inside the
+// hash bucket found, a binary search is executed for hash conflicts. Finally,
+// a linear search is used.
+
+extern TableFactory* NewPlainTableFactory(const PlainTableOptions& options =
+                                              PlainTableOptions());
+
+struct CuckooTablePropertyNames {
+  static const std::string kEmptyKey;
+  static const std::string kValueLength;
+  static const std::string kNumHashTable;
+  static const std::string kMaxNumBuckets;
+  static const std::string kIsLastLevel;
+};
+
+#endif  // ROCKSDB_LITE
+
+// A base class for table factories.
 class TableFactory {
  public:
   virtual ~TableFactory() {}
@@ -139,7 +212,7 @@ class TableFactory {
   // in parameter file. It's the caller's responsibility to make sure
   // file is in the correct format.
   //
-  // GetTableReader() is called in two places:
+  // NewTableReader() is called in two places:
   // (1) TableCache::FindTable() calls the function when table cache miss
   //     and cache the table object returned.
   // (1) SstFileReader (for SST Dump) opens the table and dump the table
@@ -150,9 +223,10 @@ class TableFactory {
   // file is a file handler to handle the file for the table
   // file_size is the physical file size of the file
   // table_reader is the output table reader
-  virtual Status GetTableReader(
+  virtual Status NewTableReader(
       const Options& options, const EnvOptions& soptions,
-      unique_ptr<RandomAccessFile> && file, uint64_t file_size,
+      const InternalKeyComparator& internal_comparator,
+      unique_ptr<RandomAccessFile>&& file, uint64_t file_size,
       unique_ptr<TableReader>* table_reader) const = 0;
 
   // Return a table builder to write to a file for this table type.
@@ -173,8 +247,24 @@ class TableFactory {
   // file is a handle of a writable file. It is the caller's responsibility to
   // keep the file open and close the file after closing the table builder.
   // compression_type is the compression type to use in this table.
-  virtual TableBuilder* GetTableBuilder(
-      const Options& options, WritableFile* file,
-      CompressionType compression_type) const = 0;
+  virtual TableBuilder* NewTableBuilder(
+      const Options& options, const InternalKeyComparator& internal_comparator,
+      WritableFile* file, CompressionType compression_type) const = 0;
 };
+
+#ifndef ROCKSDB_LITE
+// Create a special table factory that can open both of block based table format
+// and plain table, based on setting inside the SST files. It should be used to
+// convert a DB from one table format to another.
+// @table_factory_to_write: the table factory used when writing to new files.
+// @block_based_table_factory:  block based table factory to use. If NULL, use
+//                              a default one.
+// @plain_table_factory: plain table factory to use. If NULL, use a default one.
+extern TableFactory* NewAdaptiveTableFactory(
+    std::shared_ptr<TableFactory> table_factory_to_write = nullptr,
+    std::shared_ptr<TableFactory> block_based_table_factory = nullptr,
+    std::shared_ptr<TableFactory> plain_table_factory = nullptr);
+
+#endif  // ROCKSDB_LITE
+
 }  // namespace rocksdb

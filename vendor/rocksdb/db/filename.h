@@ -11,7 +11,9 @@
 
 #pragma once
 #include <stdint.h>
+#include <unordered_map>
 #include <string>
+#include <vector>
 #include "rocksdb/slice.h"
 #include "rocksdb/status.h"
 #include "rocksdb/transaction_log.h"
@@ -20,6 +22,7 @@
 namespace rocksdb {
 
 class Env;
+class Directory;
 
 enum FileType {
   kLogFile,
@@ -32,6 +35,9 @@ enum FileType {
   kMetaDatabase,
   kIdentityFile
 };
+
+// map from file number to path ID.
+typedef std::unordered_map<uint64_t, uint32_t> FileNumToPathIdMap;
 
 // Return the name of the log file with the specified number
 // in the db named by "dbname".  The result will be prefixed with
@@ -47,10 +53,15 @@ extern std::string ArchivalDirectory(const std::string& dbname);
 extern std::string ArchivedLogFileName(const std::string& dbname,
                                        uint64_t num);
 
+extern std::string MakeTableFileName(const std::string& name, uint64_t number);
+
 // Return the name of the sstable with the specified number
 // in the db named by "dbname".  The result will be prefixed with
 // "dbname".
-extern std::string TableFileName(const std::string& dbname, uint64_t number);
+extern std::string TableFileName(const std::vector<DbPath>& db_paths,
+                                 uint64_t number, uint32_t path_id);
+
+extern std::string FormatFileNumber(uint64_t number, uint32_t path_id);
 
 // Return the name of the descriptor file for the db named by
 // "dbname" and the specified incarnation number.  The result will be
@@ -100,7 +111,8 @@ extern bool ParseFileName(const std::string& filename,
 // Make the CURRENT file point to the descriptor file with the
 // specified number.
 extern Status SetCurrentFile(Env* env, const std::string& dbname,
-                             uint64_t descriptor_number);
+                             uint64_t descriptor_number,
+                             Directory* directory_to_fsync);
 
 // Make the IDENTITY file for the db
 extern Status SetIdentityFile(Env* env, const std::string& dbname);

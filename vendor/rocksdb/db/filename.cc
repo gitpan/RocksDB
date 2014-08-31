@@ -11,6 +11,7 @@
 
 #include <ctype.h>
 #include <stdio.h>
+#include <vector>
 #include "db/dbformat.h"
 #include "rocksdb/env.h"
 #include "util/logging.h"
@@ -44,10 +45,6 @@ static int FlattenPath(const std::string& path, char* dest, int len) {
   return write_idx;
 }
 
-// A utility routine: write "data" to the named file and Sync() it.
-extern Status WriteStringToFileSync(Env* env, const Slice& data,
-                                    const std::string& fname);
-
 static std::string MakeFileName(const std::string& name, uint64_t number,
                                 const char* suffix) {
   char buf[100];
@@ -70,9 +67,28 @@ std::string ArchivedLogFileName(const std::string& name, uint64_t number) {
   return MakeFileName(name + "/" + ARCHIVAL_DIR, number, "log");
 }
 
-std::string TableFileName(const std::string& name, uint64_t number) {
+std::string MakeTableFileName(const std::string& path, uint64_t number) {
+  return MakeFileName(path, number, "sst");
+}
+
+std::string TableFileName(const std::vector<DbPath>& db_paths, uint64_t number,
+                          uint32_t path_id) {
   assert(number > 0);
-  return MakeFileName(name, number, "sst");
+  std::string path;
+  if (path_id >= db_paths.size()) {
+    path = db_paths.back().path;
+  } else {
+    path = db_paths[path_id].path;
+  }
+  return MakeTableFileName(path, number);
+}
+
+std::string FormatFileNumber(uint64_t number, uint32_t path_id) {
+  if (path_id == 0) {
+    return std::to_string(number);
+  } else {
+    return std::to_string(number) + "(path " + std::to_string(path_id) + ")";
+  }
 }
 
 std::string DescriptorFileName(const std::string& dbname, uint64_t number) {
@@ -92,7 +108,6 @@ std::string LockFileName(const std::string& dbname) {
 }
 
 std::string TempFileName(const std::string& dbname, uint64_t number) {
-  assert(number >= 0);
   return MakeFileName(dbname, number, "dbtmp");
 }
 
@@ -231,18 +246,23 @@ bool ParseFileName(const std::string& fname,
 }
 
 Status SetCurrentFile(Env* env, const std::string& dbname,
-                      uint64_t descriptor_number) {
+                      uint64_t descriptor_number,
+                      Directory* directory_to_fsync) {
   // Remove leading "dbname/" and add newline to manifest file name
   std::string manifest = DescriptorFileName(dbname, descriptor_number);
   Slice contents = manifest;
   assert(contents.starts_with(dbname + "/"));
   contents.remove_prefix(dbname.size() + 1);
   std::string tmp = TempFileName(dbname, descriptor_number);
-  Status s = WriteStringToFileSync(env, contents.ToString() + "\n", tmp);
+  Status s = WriteStringToFile(env, contents.ToString() + "\n", tmp, true);
   if (s.ok()) {
     s = env->RenameFile(tmp, CurrentFileName(dbname));
   }
-  if (!s.ok()) {
+  if (s.ok()) {
+    if (directory_to_fsync != nullptr) {
+      directory_to_fsync->Fsync();
+    }
+  } else {
     env->DeleteFile(tmp);
   }
   return s;
@@ -253,7 +273,7 @@ Status SetIdentityFile(Env* env, const std::string& dbname) {
   assert(!id.empty());
   // Reserve the filename dbname/000000.dbtmp for the temporary identity file
   std::string tmp = TempFileName(dbname, 0);
-  Status s = WriteStringToFileSync(env, id, tmp);
+  Status s = WriteStringToFile(env, id, tmp, true);
   if (s.ok()) {
     s = env->RenameFile(tmp, IdentityFileName(dbname));
   }

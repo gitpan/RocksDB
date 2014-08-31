@@ -46,6 +46,11 @@
 #include <bzlib.h>
 #endif
 
+#if defined(LZ4)
+#include <lz4.h>
+#include <lz4hc.h>
+#endif
+
 #include <stdint.h>
 #include <string>
 #include <string.h>
@@ -92,11 +97,16 @@ class Mutex {
 
   void Lock();
   void Unlock();
-  void AssertHeld() { }
+  // this will assert if the mutex is not locked
+  // it does NOT verify that mutex is held by a calling thread
+  void AssertHeld();
 
  private:
   friend class CondVar;
   pthread_mutex_t mu_;
+#ifndef NDEBUG
+  bool locked_;
+#endif
 
   // No copying
   Mutex(const Mutex&);
@@ -110,7 +120,8 @@ class RWMutex {
 
   void ReadLock();
   void WriteLock();
-  void Unlock();
+  void ReadUnlock();
+  void WriteUnlock();
   void AssertHeld() { }
 
  private:
@@ -126,6 +137,8 @@ class CondVar {
   explicit CondVar(Mutex* mu);
   ~CondVar();
   void Wait();
+  // Timed condition wait.  Returns true if timeout occurred.
+  bool TimedWait(uint64_t abs_time_us);
   void Signal();
   void SignalAll();
  private:
@@ -349,13 +362,12 @@ inline bool BZip2_Compress(const CompressionOptions& opts, const char* input,
   output->resize(output->size() - _stream.avail_out);
   BZ2_bzCompressEnd(&_stream);
   return true;
-  return output;
 #endif
   return false;
 }
 
-inline char*  BZip2_Uncompress(const char* input_data, size_t input_length,
-    int* decompress_size) {
+inline char* BZip2_Uncompress(const char* input_data, size_t input_length,
+                              int* decompress_size) {
 #ifdef BZIP2
   bz_stream _stream;
   memset(&_stream, 0, sizeof(bz_stream));
@@ -396,7 +408,6 @@ inline char*  BZip2_Uncompress(const char* input_data, size_t input_length,
         _stream.next_out = (char *)(output + old_sz);
         _stream.avail_out = output_len - old_sz;
         break;
-      case Z_BUF_ERROR:
       default:
         delete[] output;
         BZ2_bzDecompressEnd(&_stream);
@@ -411,9 +422,70 @@ inline char*  BZip2_Uncompress(const char* input_data, size_t input_length,
   return nullptr;
 }
 
-inline bool GetHeapProfile(void (*func)(void*, const char*, int), void* arg) {
+inline bool LZ4_Compress(const CompressionOptions &opts, const char *input,
+                         size_t length, ::std::string* output) {
+#ifdef LZ4
+  int compressBound = LZ4_compressBound(length);
+  output->resize(8 + compressBound);
+  char *p = const_cast<char *>(output->c_str());
+  memcpy(p, &length, sizeof(length));
+  size_t outlen;
+  outlen = LZ4_compress_limitedOutput(input, p + 8, length, compressBound);
+  if (outlen == 0) {
+    return false;
+  }
+  output->resize(8 + outlen);
+  return true;
+#endif
   return false;
 }
+
+inline char* LZ4_Uncompress(const char* input_data, size_t input_length,
+                            int* decompress_size) {
+#ifdef LZ4
+  if (input_length < 8) {
+    return nullptr;
+  }
+  int output_len;
+  memcpy(&output_len, input_data, sizeof(output_len));
+  char *output = new char[output_len];
+  *decompress_size = LZ4_decompress_safe_partial(
+      input_data + 8, output, input_length - 8, output_len, output_len);
+  if (*decompress_size < 0) {
+    delete[] output;
+    return nullptr;
+  }
+  return output;
+#endif
+  return nullptr;
+}
+
+inline bool LZ4HC_Compress(const CompressionOptions &opts, const char* input,
+                           size_t length, ::std::string* output) {
+#ifdef LZ4
+  int compressBound = LZ4_compressBound(length);
+  output->resize(8 + compressBound);
+  char *p = const_cast<char *>(output->c_str());
+  memcpy(p, &length, sizeof(length));
+  size_t outlen;
+#ifdef LZ4_VERSION_MAJOR  // they only started defining this since r113
+  outlen = LZ4_compressHC2_limitedOutput(input, p + 8, length, compressBound,
+                                         opts.level);
+#else
+  outlen = LZ4_compressHC_limitedOutput(input, p + 8, length, compressBound);
+#endif
+  if (outlen == 0) {
+    return false;
+  }
+  output->resize(8 + outlen);
+  return true;
+#endif
+  return false;
+}
+
+#define CACHE_LINE_SIZE 64U
+
+#define PREFETCH(addr, rw, locality) __builtin_prefetch(addr, rw, locality)
 
 } // namespace port
 } // namespace rocksdb

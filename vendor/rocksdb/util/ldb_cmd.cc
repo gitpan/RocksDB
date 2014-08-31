@@ -3,6 +3,7 @@
 //  LICENSE file in the root directory of this source tree. An additional grant
 //  of patent rights can be found in the PATENTS file in the same directory.
 //
+#ifndef ROCKSDB_LITE
 #include "util/ldb_cmd.h"
 
 #include "db/dbformat.h"
@@ -11,10 +12,13 @@
 #include "db/filename.h"
 #include "db/write_batch_internal.h"
 #include "rocksdb/write_batch.h"
+#include "rocksdb/cache.h"
 #include "util/coding.h"
+#include "utilities/ttl/db_ttl_impl.h"
 
 #include <ctime>
 #include <dirent.h>
+#include <limits>
 #include <sstream>
 #include <string>
 #include <stdexcept>
@@ -47,13 +51,14 @@ const char* LDBCommand::DELIM = " ==> ";
 LDBCommand* LDBCommand::InitFromCmdLineArgs(
   int argc,
   char** argv,
-  const Options& options
+  const Options& options,
+  const LDBOptions& ldb_options
 ) {
   vector<string> args;
   for (int i = 1; i < argc; i++) {
     args.push_back(argv[i]);
   }
-  return InitFromCmdLineArgs(args, options);
+  return InitFromCmdLineArgs(args, options, ldb_options);
 }
 
 /**
@@ -68,7 +73,8 @@ LDBCommand* LDBCommand::InitFromCmdLineArgs(
  */
 LDBCommand* LDBCommand::InitFromCmdLineArgs(
   const vector<string>& args,
-  const Options& options
+  const Options& options,
+  const LDBOptions& ldb_options
 ) {
   // --x=y command line arguments are added as x->y map entries.
   map<string, string> option_map;
@@ -112,7 +118,8 @@ LDBCommand* LDBCommand::InitFromCmdLineArgs(
   );
 
   if (command) {
-    command->SetOptions(options);
+    command->SetDBOptions(options);
+    command->SetLDBOptions(ldb_options);
   }
   return command;
 }
@@ -152,8 +159,12 @@ LDBCommand* LDBCommand::SelectCommand(
     return new DBLoaderCommand(cmdParams, option_map, flags);
   } else if (cmd == ManifestDumpCommand::Name()) {
     return new ManifestDumpCommand(cmdParams, option_map, flags);
+  } else if (cmd == ListColumnFamiliesCommand::Name()) {
+    return new ListColumnFamiliesCommand(cmdParams, option_map, flags);
   } else if (cmd == InternalDumpCommand::Name()) {
     return new InternalDumpCommand(cmdParams, option_map, flags);
+  } else if (cmd == CheckConsistencyCommand::Name()) {
+    return new CheckConsistencyCommand(cmdParams, option_map, flags);
   }
   return nullptr;
 }
@@ -244,6 +255,10 @@ Options LDBCommand::PrepareOptionsForOpenDB() {
       opt.compression = kZlibCompression;
     } else if (comp == "bzip2") {
       opt.compression = kBZip2Compression;
+    } else if (comp == "lz4") {
+      opt.compression = kLZ4Compression;
+    } else if (comp == "lz4hc") {
+      opt.compression = kLZ4HCCompression;
     } else {
       // Unknown compression.
       exec_state_ = LDBCommandExecuteResult::FAILED(
@@ -270,6 +285,10 @@ Options LDBCommand::PrepareOptionsForOpenDB() {
       exec_state_ = LDBCommandExecuteResult::FAILED(ARG_FILE_SIZE +
                       " must be > 0.");
     }
+  }
+
+  if (opt.db_paths.size() == 0) {
+    opt.db_paths.emplace_back(db_path_, std::numeric_limits<uint64_t>::max());
   }
 
   return opt;
@@ -534,11 +553,14 @@ void ManifestDumpCommand::DoCommand() {
   EnvOptions sopt;
   std::string file(manifestfile);
   std::string dbname("dummy");
-  TableCache* tc = new TableCache(dbname, &options, sopt, 10);
-  const InternalKeyComparator* cmp =
-    new InternalKeyComparator(options.comparator);
-
-  VersionSet* versions = new VersionSet(dbname, &options, sopt, tc, cmp);
+  std::shared_ptr<Cache> tc(NewLRUCache(
+      options.max_open_files - 10, options.table_cache_numshardbits,
+      options.table_cache_remove_scan_count_limit));
+  // Notice we are using the default options not through SanitizeOptions(),
+  // if VersionSet::DumpManifest() depends on any option done by
+  // SanitizeOptions(), we need to initialize it manually.
+  options.db_paths.emplace_back("dummy", 0);
+  VersionSet* versions = new VersionSet(dbname, &options, sopt, tc.get());
   Status s = versions->DumpManifest(options, file, verbose_, is_key_hex_);
   if (!s.ok()) {
     printf("Error in processing file %s %s\n", manifestfile.c_str(),
@@ -550,6 +572,50 @@ void ManifestDumpCommand::DoCommand() {
 }
 
 // ----------------------------------------------------------------------------
+
+void ListColumnFamiliesCommand::Help(string& ret) {
+  ret.append("  ");
+  ret.append(ListColumnFamiliesCommand::Name());
+  ret.append(" full_path_to_db_directory ");
+  ret.append("\n");
+}
+
+ListColumnFamiliesCommand::ListColumnFamiliesCommand(
+    const vector<string>& params, const map<string, string>& options,
+    const vector<string>& flags)
+    : LDBCommand(options, flags, false, {}) {
+
+  if (params.size() != 1) {
+    exec_state_ = LDBCommandExecuteResult::FAILED(
+        "dbname must be specified for the list_column_families command");
+  } else {
+    dbname_ = params[0];
+  }
+}
+
+void ListColumnFamiliesCommand::DoCommand() {
+  vector<string> column_families;
+  Status s = DB::ListColumnFamilies(DBOptions(), dbname_, &column_families);
+  if (!s.ok()) {
+    printf("Error in processing db %s %s\n", dbname_.c_str(),
+           s.ToString().c_str());
+  } else {
+    printf("Column families in %s: \n{", dbname_.c_str());
+    bool first = true;
+    for (auto cf : column_families) {
+      if (!first) {
+        printf(", ");
+      }
+      first = false;
+      printf("%s", cf.c_str());
+    }
+    printf("}\n");
+  }
+}
+
+// ----------------------------------------------------------------------------
+
+namespace {
 
 string ReadableTime(int unixtime) {
   char time_buffer [80];
@@ -583,6 +649,8 @@ void PrintBucketCounts(const vector<uint64_t>& bucket_counts, int ttl_start,
           ReadableTime(ttl_end).c_str(),
           (unsigned long)bucket_counts[num_buckets - 1]);
 }
+
+}  // namespace
 
 const string InternalDumpCommand::ARG_COUNT_ONLY = "count_only";
 const string InternalDumpCommand::ARG_COUNT_DELIM = "count_delim";
@@ -854,11 +922,11 @@ void DBDumperCommand::DoCommand() {
   int max_keys = max_keys_;
   int ttl_start;
   if (!ParseIntOption(option_map_, ARG_TTL_START, ttl_start, exec_state_)) {
-    ttl_start = DBWithTTL::kMinTimestamp; // TTL introduction time
+    ttl_start = DBWithTTLImpl::kMinTimestamp;  // TTL introduction time
   }
   int ttl_end;
   if (!ParseIntOption(option_map_, ARG_TTL_END, ttl_end, exec_state_)) {
-    ttl_end = DBWithTTL::kMaxTimestamp; // Max time allowed by TTL feature
+    ttl_end = DBWithTTLImpl::kMaxTimestamp;  // Max time allowed by TTL feature
   }
   if (ttl_end < ttl_start) {
     fprintf(stderr, "Error: End time can't be less than start time\n");
@@ -1003,7 +1071,7 @@ Options ReduceDBLevelsCommand::PrepareOptionsForOpenDB() {
   opt.num_levels = old_levels_;
   opt.max_bytes_for_level_multiplier_additional.resize(opt.num_levels, 1);
   // Disable size compaction
-  opt.max_bytes_for_level_base = 1UL << 50;
+  opt.max_bytes_for_level_base = 1ULL << 50;
   opt.max_bytes_for_level_multiplier = 1;
   opt.max_mem_compaction_level = 0;
   return opt;
@@ -1012,19 +1080,26 @@ Options ReduceDBLevelsCommand::PrepareOptionsForOpenDB() {
 Status ReduceDBLevelsCommand::GetOldNumOfLevels(Options& opt,
     int* levels) {
   EnvOptions soptions;
-  TableCache tc(db_path_, &opt, soptions, 10);
+  std::shared_ptr<Cache> tc(
+      NewLRUCache(opt.max_open_files - 10, opt.table_cache_numshardbits,
+                  opt.table_cache_remove_scan_count_limit));
   const InternalKeyComparator cmp(opt.comparator);
-  VersionSet versions(db_path_, &opt, soptions, &tc, &cmp);
+  VersionSet versions(db_path_, &opt, soptions, tc.get());
+  std::vector<ColumnFamilyDescriptor> dummy;
+  ColumnFamilyDescriptor dummy_descriptor(kDefaultColumnFamilyName,
+                                          ColumnFamilyOptions(opt));
+  dummy.push_back(dummy_descriptor);
   // We rely the VersionSet::Recover to tell us the internal data structures
   // in the db. And the Recover() should never do any change
   // (like LogAndApply) to the manifest file.
-  Status st = versions.Recover();
+  Status st = versions.Recover(dummy);
   if (!st.ok()) {
     return st;
   }
   int max = -1;
-  for (int i = 0; i < versions.NumberLevels(); i++) {
-    if (versions.NumLevelFiles(i)) {
+  auto default_cfd = versions.GetColumnFamilySet()->GetDefault();
+  for (int i = 0; i < default_cfd->NumberLevels(); i++) {
+    if (default_cfd->current()->NumLevelFiles(i)) {
       max = i;
     }
   }
@@ -1069,23 +1144,7 @@ void ReduceDBLevelsCommand::DoCommand() {
   CloseDB();
 
   EnvOptions soptions;
-  TableCache tc(db_path_, &opt, soptions, 10);
-  const InternalKeyComparator cmp(opt.comparator);
-  VersionSet versions(db_path_, &opt, soptions, &tc, &cmp);
-  // We rely the VersionSet::Recover to tell us the internal data structures
-  // in the db. And the Recover() should never do any change (like LogAndApply)
-  // to the manifest file.
-  st = versions.Recover();
-  if (!st.ok()) {
-    exec_state_ = LDBCommandExecuteResult::FAILED(st.ToString());
-    return;
-  }
-
-  port::Mutex mu;
-  mu.Lock();
-  st = versions.ReduceNumberOfLevels(new_levels_, &mu);
-  mu.Unlock();
-
+  st = VersionSet::ReduceNumberOfLevels(db_path_, &opt, soptions, new_levels_);
   if (!st.ok()) {
     exec_state_ = LDBCommandExecuteResult::FAILED(st.ToString());
     return;
@@ -1554,11 +1613,11 @@ void ScanCommand::DoCommand() {
   }
   int ttl_start;
   if (!ParseIntOption(option_map_, ARG_TTL_START, ttl_start, exec_state_)) {
-    ttl_start = DBWithTTL::kMinTimestamp; // TTL introduction time
+    ttl_start = DBWithTTLImpl::kMinTimestamp;  // TTL introduction time
   }
   int ttl_end;
   if (!ParseIntOption(option_map_, ARG_TTL_END, ttl_end, exec_state_)) {
-    ttl_end = DBWithTTL::kMaxTimestamp; // Max time allowed by TTL feature
+    ttl_end = DBWithTTLImpl::kMaxTimestamp;  // Max time allowed by TTL feature
   }
   if (ttl_end < ttl_start) {
     fprintf(stderr, "Error: End time can't be less than start time\n");
@@ -1572,7 +1631,7 @@ void ScanCommand::DoCommand() {
   for ( ;
         it->Valid() && (!end_key_specified_ || it->key().ToString() < end_key_);
         it->Next()) {
-    string key = it->key().ToString();
+    string key = ldb_options_.key_formatter->Format(it->key());
     if (is_db_ttl_) {
       TtlIterator* it_ttl = dynamic_cast<TtlIterator*>(it);
       assert(it_ttl);
@@ -1586,8 +1645,8 @@ void ScanCommand::DoCommand() {
     }
     string value = it->value().ToString();
     fprintf(stdout, "%s : %s\n",
-          (is_key_hex_ ? StringToHex(key) : key).c_str(),
-          (is_value_hex_ ? StringToHex(value) : value).c_str()
+            (is_key_hex_ ? "0x" + it->key().ToString(true) : key).c_str(),
+            (is_value_hex_ ? StringToHex(value) : value).c_str()
         );
     num_keys_scanned++;
     if (max_keys_scanned_ >= 0 && num_keys_scanned >= max_keys_scanned_) {
@@ -1760,5 +1819,33 @@ void DBQuerierCommand::DoCommand() {
   }
 }
 
-
+CheckConsistencyCommand::CheckConsistencyCommand(const vector<string>& params,
+    const map<string, string>& options, const vector<string>& flags) :
+  LDBCommand(options, flags, false,
+             BuildCmdLineOptions({})) {
 }
+
+void CheckConsistencyCommand::Help(string& ret) {
+  ret.append("  ");
+  ret.append(CheckConsistencyCommand::Name());
+  ret.append("\n");
+}
+
+void CheckConsistencyCommand::DoCommand() {
+  Options opt = PrepareOptionsForOpenDB();
+  opt.paranoid_checks = true;
+  if (!exec_state_.IsNotStarted()) {
+    return;
+  }
+  DB* db;
+  Status st = DB::OpenForReadOnly(opt, db_path_, &db, false);
+  delete db;
+  if (st.ok()) {
+    fprintf(stdout, "OK\n");
+  } else {
+    exec_state_ = LDBCommandExecuteResult::FAILED(st.ToString());
+  }
+}
+
+}   // namespace rocksdb
+#endif  // ROCKSDB_LITE

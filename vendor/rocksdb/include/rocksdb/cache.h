@@ -102,7 +102,25 @@ class Cache {
   virtual uint64_t NewId() = 0;
 
   // returns the maximum configured capacity of the cache
-  virtual size_t GetCapacity() = 0;
+  virtual size_t GetCapacity() const = 0;
+
+  // returns the memory size for the entries residing in the cache.
+  virtual size_t GetUsage() const = 0;
+
+  // Call this on shutdown if you want to speed it up. Cache will disown
+  // any underlying data and will not free it on delete. This call will leak
+  // memory - call this only if you're shutting down the process.
+  // Any attempts of using cache after this call will fail terribly.
+  // Always delete the DB object before calling this method!
+  virtual void DisownData() {
+    // default implementation is noop
+  };
+
+  // Apply callback to all entries in the cache
+  // If thread_safe is true, it will also lock the accesses. Otherwise, it will
+  // access the cache without the lock held
+  virtual void ApplyToAllCacheEntries(void (*callback)(void*, size_t),
+                                      bool thread_safe) = 0;
 
  private:
   void LRU_Remove(Handle* e);

@@ -38,9 +38,16 @@ class PosixLogger : public Logger {
   Env* env_;
   bool flush_pending_;
  public:
-  PosixLogger(FILE* f, uint64_t (*gettid)(), Env* env) :
-    file_(f), gettid_(gettid), log_size_(0), fd_(fileno(f)),
-    last_flush_micros_(0), env_(env), flush_pending_(false) { }
+  PosixLogger(FILE* f, uint64_t (*gettid)(), Env* env,
+              const InfoLogLevel log_level = InfoLogLevel::ERROR_LEVEL)
+      : Logger(log_level),
+        file_(f),
+        gettid_(gettid),
+        log_size_(0),
+        fd_(fileno(f)),
+        last_flush_micros_(0),
+        env_(env),
+        flush_pending_(false) {}
   virtual ~PosixLogger() {
     fclose(file_);
   }
@@ -111,7 +118,7 @@ class PosixLogger : public Logger {
       assert(p <= limit);
       const size_t write_size = p - base;
 
-#ifdef OS_LINUX
+#ifdef ROCKSDB_FALLOCATE_PRESENT
       // If this write would cross a boundary of kDebugLogChunkSize
       // space, pre-allocate more space to avoid overly large
       // allocations from filesystem allocsize options.
